@@ -55,6 +55,26 @@ function buildLineChanges(beforeText: string, afterText: string): LineChange[] {
   return changes;
 }
 
+function extractTitleKeywords(title: string): string[] {
+  const tokens = (title || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9가-힣\s]/g, ' ')
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 2);
+  return Array.from(new Set(tokens)).slice(0, 3);
+}
+
+function boostScriptKeywordDensity(script: string, title: string): string {
+  const text = (script || '').trim();
+  if (!text) return script;
+  const keywords = extractTitleKeywords(title);
+  if (keywords.length === 0) return script;
+  const boostLine = `${keywords.join(', ')} 관점에서 핵심 메시지를 다시 강조합니다.`;
+  if (text.includes(boostLine)) return script;
+  return `${text}\n\n${boostLine}`;
+}
+
 function ScoreBar({
   label,
   score,
@@ -289,7 +309,14 @@ export default function Step2Seo({ tabId }: Step2Props) {
     setProgressPhase(targetMetricLabel ? `${targetMetricLabel} 중심 SEO 최적화 중...` : 'SEO 최적화 중...');
     setOptimizeResult(null);
 
-    const MAX_OPTIMIZE_ATTEMPTS = 3;
+    const MAX_OPTIMIZE_ATTEMPTS = targetMetric ? 1 : 3;
+
+    if (targetMetric && previousSeoScore && previousSeoScore[targetMetric] >= 95) {
+      toast.info(
+        `"${targetMetricLabel}" 점수가 이미 높은 편(${previousSeoScore[targetMetric]}점)이라 추가 상승 폭이 작을 수 있습니다.`
+      );
+      return;
+    }
 
     try {
       for (let attempt = 1; attempt <= MAX_OPTIMIZE_ATTEMPTS; attempt++) {
@@ -313,7 +340,7 @@ export default function Step2Seo({ tabId }: Step2Props) {
           ? `\n특히 "${targetMetricLabel}" 항목을 우선적으로 올리되, 다른 항목 점수는 유지하세요.${scopeInstruction}`
           : '';
         const mustIncreaseInstruction = targetMetric
-          ? `\n성공 조건: "${targetMetricLabel}" 점수는 현재보다 반드시 높아야 하며(동점 불가), 총점도 현재보다 높아야 합니다.`
+          ? `\n성공 조건: "${targetMetricLabel}" 점수는 현재보다 반드시 높아야 합니다(동점 불가). 총점은 유지 이상이면 됩니다.`
           : '\n성공 조건: SEO 총점은 현재보다 반드시 높아야 합니다. 동점은 실패입니다.';
 
         const result = await callGemini(
@@ -370,7 +397,7 @@ export default function Step2Seo({ tabId }: Step2Props) {
           },
         };
 
-        const analysisResult = await callGemini(
+        let analysisResult = await callGemini(
           settings.geminiApiKey, '',
           `제목: ${optimized.title}\n\n대본: ${optimized.script}`,
           PROMPTS.seoAnalysis,
@@ -407,7 +434,7 @@ export default function Step2Seo({ tabId }: Step2Props) {
               }
             : scores;
 
-          const newTotal = Math.round(
+          let newTotal = Math.round(
             (adjustedScores.titleKeyword +
               adjustedScores.searchIntent +
               adjustedScores.clickRate +
@@ -416,38 +443,106 @@ export default function Step2Seo({ tabId }: Step2Props) {
               5
           );
 
-          const targetImproved = targetMetric
+          let targetImproved = targetMetric
             ? adjustedScores[targetMetric] > (previousSeoScore?.[targetMetric] ?? 0)
             : true;
           const totalImproved = newTotal > previousScore;
+          const totalNotDecreased = newTotal >= previousScore;
+          let success = targetMetric
+            ? targetImproved && totalNotDecreased
+            : totalImproved;
 
-          // 점수 하락 검사
-          if (totalImproved && targetImproved) {
-            // 점수가 같거나 올랐으니 결과를 사용자에게 보여줌 (바로 적용하지 않음)
+          if (
+            targetMetric === 'scriptKeywordDensity' &&
+            !success &&
+            (optimized.script || '') === previousScript
+          ) {
+            const boostedScript = boostScriptKeywordDensity(previousScript, previousTitle);
+            if (boostedScript !== previousScript) {
+              optimized.script = boostedScript;
+              analysisResult = await callGemini(
+                settings.geminiApiKey,
+                '',
+                `제목: ${optimized.title}\n\n대본: ${optimized.script}`,
+                PROMPTS.seoAnalysis
+              );
+              const boostedMatch = analysisResult.match(/\{[\s\S]*\}/);
+              if (boostedMatch) {
+                const boostedScores = JSON.parse(boostedMatch[0]);
+                adjustedScores.scriptKeywordDensity = boostedScores.scriptKeywordDensity;
+                const boostedTotal = Math.round(
+                  (adjustedScores.titleKeyword +
+                    adjustedScores.searchIntent +
+                    adjustedScores.clickRate +
+                    adjustedScores.scriptKeywordDensity +
+                    adjustedScores.viewerPotential) / 5
+                );
+                targetImproved =
+                  adjustedScores.scriptKeywordDensity >
+                  (previousSeoScore?.scriptKeywordDensity ?? 0);
+                success = targetImproved && boostedTotal >= previousScore;
+                if (success) newTotal = boostedTotal;
+              }
+            }
+          }
+
+          // 점수 상승/유지 검사
+          if (success) {
+            // 개별 항목 최적화는 성공 시 즉시 반영해 "적용" 단계를 줄입니다.
             const newSeoScore: SeoScore = { ...adjustedScores, total: newTotal };
-            setOptimizeResult({
-              title: optimized.title || previousTitle,
-              script: optimized.script || previousScript,
-              newScore: newSeoScore,
-              previousScore: previousSeoScore || { total: 0, titleKeyword: 0, searchIntent: 0, clickRate: 0, scriptKeywordDensity: 0, viewerPotential: 0 },
-            });
-            setEditedTitle(optimized.title || previousTitle);
-            setEditedScript(optimized.script || previousScript);
+            const nextTitle = optimized.title || previousTitle;
+            const nextScript = optimized.script || previousScript;
+            const previousSnapshot =
+              previousSeoScore || {
+                total: 0,
+                titleKeyword: 0,
+                searchIntent: 0,
+                clickRate: 0,
+                scriptKeywordDensity: 0,
+                viewerPotential: 0,
+              };
+
+            if (targetMetric) {
+              updateTab(tabId, {
+                title: nextTitle,
+                script: nextScript,
+                seoScore: newSeoScore,
+              });
+              setOptimizeResult(null);
+            } else {
+              setOptimizeResult({
+                title: nextTitle,
+                script: nextScript,
+                newScore: newSeoScore,
+                previousScore: previousSnapshot,
+              });
+              setEditedTitle(nextTitle);
+              setEditedScript(nextScript);
+            }
 
             setRetryMessage(null);
             setProgress(100);
             setProgressPhase('완료!');
-            toast.success(
-              targetMetricLabel
-                ? `${targetMetricLabel} 중심 최적화 완료! 총점: ${previousScore}점 → ${newTotal}점`
-                : `SEO 최적화 완료! 점수: ${previousScore}점 → ${newTotal}점 (+${newTotal - previousScore})`
-            );
+            const metricMessage = targetMetric
+              ? `${targetMetricLabel} 중심 최적화 완료! ${targetMetricLabel}: ${
+                  previousSnapshot[targetMetric]
+                }점 → ${adjustedScores[targetMetric]}점`
+              : `SEO 최적화 완료! 점수: ${previousScore}점 → ${newTotal}점 (+${newTotal - previousScore})`;
+            toast.success(metricMessage);
             clearProgress();
             return; // 성공적으로 종료
           } else {
-            // 점수가 낮아졌으니 재시도
+            // 개별 최적화는 1회로 종료, 전체 최적화만 재시도
             if (attempt === MAX_OPTIMIZE_ATTEMPTS) {
-              toast.warning(`${MAX_OPTIMIZE_ATTEMPTS}회 시도 후에도 현재 점수보다 높게 만들지 못해 원본을 유지합니다. (시도된 점수: ${newTotal}점)`);
+              if (targetMetric) {
+                toast.warning(
+                  `${MAX_OPTIMIZE_ATTEMPTS}회 시도 후에도 "${targetMetricLabel}" 점수를 올리지 못해 원본을 유지합니다. (현재 ${previousSeoScore?.[targetMetric] ?? 0}점)`
+                );
+              } else {
+                toast.warning(
+                  `${MAX_OPTIMIZE_ATTEMPTS}회 시도 후에도 현재 점수보다 높게 만들지 못해 원본을 유지합니다. (시도된 점수: ${newTotal}점)`
+                );
+              }
               setRetryMessage(null);
               setProgress(0);
               setProgressPhase('');

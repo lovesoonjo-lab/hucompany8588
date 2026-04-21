@@ -100,15 +100,33 @@ export default function Step4Analyze({ tabId }: Step4Props) {
 
   const countEmbeddedSceneHints = (script: string): number => {
     const text = script || '';
+    const normalizeLabelLine = (line: string) =>
+      line
+        .replace(/\uF000/g, ' ')
+        .replace(/^[^A-Za-z가-힣0-9]+/, '')
+        .trim();
+
+    const lines = text
+      .split('\n')
+      .map((line) => normalizeLabelLine(line))
+      .filter(Boolean);
 
     // 장면 번호 패턴: "장면 1", "Scene 1", "#1"
     const sceneLabelMatches = text.match(/(?:장면|scene)\s*[:#-]?\s*\d+/gi) || [];
-    // 메타 프롬프트 패턴: "Image Prompt:"
-    const imagePromptMatches = text.match(/image\s*prompt\s*[:：]/gi) || [];
+    // 메타 프롬프트 패턴: 라인 시작의 "Image Prompt"만 인식 (EN/KO 분리 라인 중복 방지)
+    const imagePromptEnCount = lines.filter((line) =>
+      /^image\s*prompt(?:\s*[\(\[]\s*en\s*[\)\]])?\s*[:：]/i.test(line)
+    ).length;
+    const imagePromptKoCount = lines.filter((line) =>
+      /^image\s*prompt\s*[\(\[]\s*ko\s*[\)\]]\s*[:：]/i.test(line)
+    ).length;
+    const imagePromptGenericCount = lines.filter((line) => /^image\s*prompt\s*[:：]/i.test(line)).length;
 
     // 장면 수는 이미지 프롬프트 개수를 가장 신뢰하고,
     // 없을 때만 장면 라벨을 사용합니다. (TTS 태그는 장면 수 산정에서 제외)
-    if (imagePromptMatches.length > 0) return imagePromptMatches.length;
+    if (imagePromptEnCount > 0) return imagePromptEnCount;
+    if (imagePromptGenericCount > 0) return imagePromptGenericCount;
+    if (imagePromptKoCount > 0) return imagePromptKoCount;
     if (sceneLabelMatches.length > 0) return sceneLabelMatches.length;
     return 0;
   };
@@ -173,7 +191,8 @@ export default function Step4Analyze({ tabId }: Step4Props) {
   const extractStructuredScenes = (script: string): SceneSlot[] => {
     type Parsed = {
       sceneNo?: number;
-      promptRaw?: string;
+      promptEn?: string;
+      promptKo?: string;
       tts?: string;
       subtitle?: string;
       motion?: string;
@@ -182,16 +201,21 @@ export default function Step4Analyze({ tabId }: Step4Props) {
 
     const lines = (script || '')
       .split('\n')
-      .map((line) => line.replace(/\uF000/g, ' ').trim())
+      .map((line) =>
+        line
+          .replace(/\uF000/g, ' ')
+          .replace(/^[^A-Za-z가-힣0-9]+/, '')
+          .trim()
+      )
       .filter(Boolean);
 
     const parsed: Parsed[] = [];
     let current: Parsed | null = null;
-    let activeField: 'promptRaw' | 'tts' | 'subtitle' | 'motion' | 'fx' | null = null;
+    let activeField: 'promptEn' | 'promptKo' | 'tts' | 'subtitle' | 'motion' | 'fx' | null = null;
 
     const pushCurrentIfValid = () => {
       if (!current) return;
-      if (current.promptRaw || current.tts || current.subtitle || current.motion || current.fx) {
+      if (current.promptEn || current.promptKo || current.tts || current.subtitle || current.motion || current.fx) {
         parsed.push(current);
       }
       current = null;
@@ -211,13 +235,24 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         continue;
       }
 
-      const imagePromptMatch = line.match(/image\s*prompt\s*[:：]\s*(.*)$/i);
+      const imagePromptMatch = line.match(
+        /^image\s*prompt(?:\s*[\(\[]\s*(en|ko)\s*[\)\]])?\s*[:：]\s*(.*)$/i
+      );
       if (imagePromptMatch) {
-        // Image Prompt가 새로 나오면 이전 장면을 닫고 새 장면으로 시작
-        if (current?.promptRaw) pushCurrentIfValid();
+        const lang = (imagePromptMatch[1] || '').toLowerCase();
+        const promptValue = (imagePromptMatch[2] || '').trim();
+        // EN Prompt를 새로 만나면 다음 장면 시작으로 본다.
+        if (current && (current.promptEn || current.promptKo) && (lang === 'en' || !lang)) {
+          pushCurrentIfValid();
+        }
         ensureCurrent();
-        current!.promptRaw = (imagePromptMatch[1] || '').trim();
-        activeField = 'promptRaw';
+        if (lang === 'ko') {
+          current!.promptKo = promptValue;
+          activeField = 'promptKo';
+        } else {
+          current!.promptEn = promptValue;
+          activeField = 'promptEn';
+        }
         continue;
       }
 
@@ -261,12 +296,10 @@ export default function Step4Analyze({ tabId }: Step4Props) {
     pushCurrentIfValid();
 
     return parsed
-      .filter((s) => Boolean(s.promptRaw))
+      .filter((s) => Boolean(s.promptEn || s.promptKo))
       .map((s, idx) => {
-        const promptRaw = (s.promptRaw || '').trim();
-        const [promptEnRaw, promptKoRaw] = promptRaw.split(/\s*\/\s*/);
-        const promptEn = (promptEnRaw || '').trim();
-        const promptKo = (promptKoRaw || promptEnRaw || '').trim();
+        const promptEn = (s.promptEn || s.promptKo || '').trim();
+        const promptKo = (s.promptKo || s.promptEn || '').trim();
         const subtitleScenes = normalizeSubtitleScenes(s.subtitle || '');
         const ttsScript = (s.tts || subtitleScenes.map((x) => x.text).join(' ') || '').trim();
         const effectType = pickEffectFromFx(s.fx || '');

@@ -28,7 +28,14 @@ export default function Home() {
   const activeProject = projects.find((p) => p.id === activeProjectId);
   const activeTabData = tabs.find((t) => t.id === activeTab);
 
-  const handleExportBackup = () => {
+  const sanitizeFileName = (raw: string) =>
+    raw
+      .replace(/[<>:"/\\|?*\u0000-\u001F]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 80);
+
+  const handleExportBackup = async () => {
     try {
       const state = useAppStore.getState();
       const mergedProjects = state.projects.map((project) =>
@@ -50,10 +57,49 @@ export default function Home() {
       const blob = new Blob([JSON.stringify(payload, null, 2)], {
         type: 'application/json',
       });
+      const baseName =
+        sanitizeFileName(activeTabData?.title || '') ||
+        sanitizeFileName(activeProject?.channelName || '') ||
+        `psych-studio-backup-${new Date().toISOString().slice(0, 10)}`;
+      const fileName = `${baseName}.json`;
+
+      if ('showSaveFilePicker' in window) {
+        try {
+          const picker = (
+            window as Window & {
+              showSaveFilePicker: (options: {
+                suggestedName: string;
+                types: Array<{ description: string; accept: Record<string, string[]> }>;
+              }) => Promise<{
+                createWritable: () => Promise<{ write: (data: Blob) => Promise<void>; close: () => Promise<void> }>;
+              }>;
+            }
+          ).showSaveFilePicker;
+
+          const handle = await picker({
+            suggestedName: fileName,
+            types: [
+              {
+                description: 'JSON Backup',
+                accept: { 'application/json': ['.json'] },
+              },
+            ],
+          });
+          const writable = await handle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          toast.success('저장 위치를 선택해 백업 파일을 저장했습니다.');
+          return;
+        } catch (err: any) {
+          if (err?.name === 'AbortError') return;
+          throw err;
+        }
+      }
+
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `psych-studio-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      a.download = fileName;
       a.click();
       URL.revokeObjectURL(url);
       toast.success('저장 파일을 다운로드했습니다.');
