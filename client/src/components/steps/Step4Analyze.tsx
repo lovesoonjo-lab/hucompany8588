@@ -98,37 +98,105 @@ export default function Step4Analyze({ tabId }: Step4Props) {
     return cleaned;
   };
 
-  const countEmbeddedSceneHints = (script: string): number => {
-    const text = script || '';
-    const normalizeLabelLine = (line: string) =>
-      line
-        .replace(/\uF000/g, ' ')
-        .replace(/^[^A-Za-z가-힣0-9]+/, '')
-        .trim();
+  const normalizeForLabelMatch = (line: string) =>
+    (line || '')
+      .normalize('NFKC')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      .replace(/[\s\u00A0]+/g, ' ')
+      .trim();
 
-    const lines = text
+  const parseSceneNumber = (line: string): number | null => {
+    const normalized = normalizeForLabelMatch(line);
+    if (!normalized) return null;
+    // 일반 문장(예: "Scene 1 narration ...") 오인식을 막기 위해
+    // Scene 라벨은 bracket/명시 구분자/단독 번호 줄만 인정합니다.
+    const m =
+      normalized.match(/^\[\s*(?:scene|장면)\s*(\d+)\s*\]$/i) ||
+      normalized.match(/^(?:scene|장면)\s*[:#-]\s*(\d+)\s*$/i) ||
+      normalized.match(/^(?:scene|장면)\s+(\d+)\s*$/i);
+    if (!m) return null;
+    const num = Number(m[1]);
+    return Number.isFinite(num) && num > 0 ? num : null;
+  };
+
+  const normalizeScriptLine = (line: string) =>
+    (line || '')
+      .replace(/\uF000/g, ' ')
+      .replace(/^[^A-Za-z가-힣0-9\[]+/, '')
+      .trim();
+
+  const splitSceneBlocks = (script: string): Array<{ sceneNo: number; lines: string[] }> => {
+    const lines = (script || '')
       .split('\n')
-      .map((line) => normalizeLabelLine(line))
+      .map((line) => normalizeScriptLine(line))
       .filter(Boolean);
 
-    // 장면 번호 패턴: "장면 1", "Scene 1", "#1"
-    const sceneLabelMatches = text.match(/(?:장면|scene)\s*[:#-]?\s*\d+/gi) || [];
-    // 메타 프롬프트 패턴: 라인 시작의 "Image Prompt"만 인식 (EN/KO 분리 라인 중복 방지)
-    const imagePromptEnCount = lines.filter((line) =>
+    const blocks: Array<{ sceneNo: number; lines: string[] }> = [];
+    let current: { sceneNo: number; lines: string[] } | null = null;
+
+    for (const line of lines) {
+      const sceneNo = parseSceneNumber(line);
+      if (sceneNo !== null) {
+        if (current) blocks.push(current);
+        current = { sceneNo, lines: [] };
+        continue;
+      }
+      if (current) current.lines.push(line);
+    }
+    if (current) blocks.push(current);
+    return blocks;
+  };
+
+  const countEmbeddedSceneHints = (script: string): number => {
+    const sceneBlocks = splitSceneBlocks(script);
+    if (sceneBlocks.length > 0) {
+      const promptBlockCount = sceneBlocks.filter((block) =>
+        block.lines.some((line) =>
+          /^image\s*prompt(?:\s*[\(\[]\s*en\s*[\)\]])?\s*[:：]/i.test(normalizeForLabelMatch(line))
+        )
+      ).length;
+      if (promptBlockCount > 0) return promptBlockCount;
+      return sceneBlocks.length;
+    }
+
+    // Scene 라벨이 없는 자유 형식 대본 fallback
+    const lines = (script || '')
+      .split('\n')
+      .map((line) => normalizeScriptLine(line))
+      .filter(Boolean);
+    const looseImagePromptCount = lines.filter((line) =>
+      /^image\s*prompt(?:\s*[\(\[]\s*en\s*[\)\]])?\s*[:：]/i.test(normalizeForLabelMatch(line))
+    ).length;
+    if (looseImagePromptCount > 0) return looseImagePromptCount;
+    const looseSceneLabels = lines.filter((line) => parseSceneNumber(line) !== null).length;
+    if (looseSceneLabels > 0) return looseSceneLabels;
+    return 0;
+  };
+
+  const countRawSceneLabels = (script: string): number => {
+    const text = (script || '')
+      .normalize('NFKC')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '');
+    const matches = text.match(/\[\s*(?:scene|장면)\s*\d+\s*\]/gi) || [];
+    return matches.length;
+  };
+
+  const countImagePromptsFromScript = (script: string): number => {
+    const sceneBlocks = splitSceneBlocks(script);
+    if (sceneBlocks.length > 0) {
+      return sceneBlocks.filter((block) =>
+        block.lines.some((line) =>
+          /^image\s*prompt(?:\s*[\(\[]\s*en\s*[\)\]])?\s*[:：]/i.test(normalizeForLabelMatch(line))
+        )
+      ).length;
+    }
+    const lines = (script || '')
+      .split('\n')
+      .map((line) => normalizeForLabelMatch(line))
+      .filter(Boolean);
+    return lines.filter((line) =>
       /^image\s*prompt(?:\s*[\(\[]\s*en\s*[\)\]])?\s*[:：]/i.test(line)
     ).length;
-    const imagePromptKoCount = lines.filter((line) =>
-      /^image\s*prompt\s*[\(\[]\s*ko\s*[\)\]]\s*[:：]/i.test(line)
-    ).length;
-    const imagePromptGenericCount = lines.filter((line) => /^image\s*prompt\s*[:：]/i.test(line)).length;
-
-    // 장면 수는 이미지 프롬프트 개수를 가장 신뢰하고,
-    // 없을 때만 장면 라벨을 사용합니다. (TTS 태그는 장면 수 산정에서 제외)
-    if (imagePromptEnCount > 0) return imagePromptEnCount;
-    if (imagePromptGenericCount > 0) return imagePromptGenericCount;
-    if (imagePromptKoCount > 0) return imagePromptKoCount;
-    if (sceneLabelMatches.length > 0) return sceneLabelMatches.length;
-    return 0;
   };
 
   const estimateTargetSceneCount = (script: string): number => {
@@ -199,15 +267,113 @@ export default function Step4Analyze({ tabId }: Step4Props) {
       fx?: string;
     };
 
+    const sceneBlocks = splitSceneBlocks(script);
+    if (sceneBlocks.length > 0) {
+      return sceneBlocks
+        .map((block, idx) => {
+          const parsed: Parsed = { sceneNo: block.sceneNo };
+          let activeField: 'promptEn' | 'promptKo' | 'tts' | 'subtitle' | 'motion' | 'fx' | null = null;
+
+          for (const line of block.lines) {
+            const labelLine = normalizeForLabelMatch(line);
+            const imagePromptMatch = labelLine.match(
+              /^image\s*prompt(?:\s*[\(\[]\s*(en|ko)\s*[\)\]])?\s*[:：]\s*(.*)$/i
+            );
+            if (imagePromptMatch) {
+              const lang = (imagePromptMatch[1] || '').toLowerCase();
+              const promptValue = (imagePromptMatch[2] || '').trim();
+              if (lang === 'ko') {
+                parsed.promptKo = promptValue;
+                activeField = 'promptKo';
+              } else {
+                parsed.promptEn = promptValue;
+                activeField = 'promptEn';
+              }
+              continue;
+            }
+
+            const ttsMatch = labelLine.match(/en\s*tts\s*script\s*[:：]\s*(.*)$/i);
+            if (ttsMatch) {
+              parsed.tts = (ttsMatch[1] || '').trim();
+              activeField = 'tts';
+              continue;
+            }
+
+            const subMatch = labelLine.match(/en\s*subtitle\s*[:：]\s*(.*)$/i);
+            if (subMatch) {
+              parsed.subtitle = (subMatch[1] || '').trim();
+              activeField = 'subtitle';
+              continue;
+            }
+
+            const motionMatch = labelLine.match(/video\s*motion\s*prompt\s*[:：]\s*(.*)$/i);
+            if (motionMatch) {
+              parsed.motion = (motionMatch[1] || '').trim();
+              activeField = 'motion';
+              continue;
+            }
+
+            const fxMatch = labelLine.match(/fx\s*tag\s*[:：]\s*(.*)$/i);
+            if (fxMatch) {
+              parsed.fx = (fxMatch[1] || '').trim();
+              activeField = 'fx';
+              continue;
+            }
+
+            if (activeField) {
+              parsed[activeField] = `${parsed[activeField] || ''} ${line}`.trim();
+            }
+          }
+
+          if (!parsed.promptEn && !parsed.promptKo) return null;
+          const promptEn = (parsed.promptEn || parsed.promptKo || '').trim();
+          const promptKo = (parsed.promptKo || parsed.promptEn || '').trim();
+          const subtitleScenes = normalizeSubtitleScenes(parsed.subtitle || '');
+          const ttsScript = (parsed.tts || subtitleScenes.map((x) => x.text).join(' ') || '').trim();
+          const effectType = pickEffectFromFx(parsed.fx || '');
+          const duration = ttsScript.length < 50 ? 2.5 : ttsScript.length < 100 ? 3.5 : 4.5;
+
+          return {
+            id: parsed.sceneNo || idx + 1,
+            promptEn,
+            promptKo,
+            effectType,
+            effectDuration: duration,
+            videoMotionPrompt: (parsed.motion || '').trim(),
+            imageUrl: null,
+            videoUrl: null,
+            isGeneratingImage: false,
+            isGeneratingVideo: false,
+            ttsScript: ttsScript || `Scene ${idx + 1} narration`,
+            subtitleScenes:
+              subtitleScenes.length > 0 ? subtitleScenes : [{ id: 1, text: ttsScript || `장면 ${idx + 1}` }],
+            audioUrl: null,
+            audioDuration: 0,
+            isGeneratingAudio: false,
+            voiceId: 'default',
+            speechRate: 1.0,
+            subtitleLines: 2,
+            subtitleSize: 48,
+            subtitlePosition: 90,
+            subtitleFont: 'Pretendard',
+            subtitleColor: '#FFFFFF',
+            subtitleOutline: true,
+            subtitleOutlineWidth: 2,
+            subtitleBg: 'none' as const,
+          } as SceneSlot;
+        })
+        .filter(Boolean)
+        .map((scene) => scene as SceneSlot)
+        .sort((a, b) => a.id - b.id)
+        .map((scene, i) => ({ ...scene, id: i + 1 }));
+    }
+
     const lines = (script || '')
       .split('\n')
-      .map((line) =>
-        line
-          .replace(/\uF000/g, ' ')
-          .replace(/^[^A-Za-z가-힣0-9]+/, '')
-          .trim()
-      )
+      .map((line) => normalizeScriptLine(line))
       .filter(Boolean);
+
+    const hasExplicitSceneLabels = lines.some((line) => parseSceneNumber(line) !== null);
 
     const parsed: Parsed[] = [];
     let current: Parsed | null = null;
@@ -227,22 +393,29 @@ export default function Step4Analyze({ tabId }: Step4Props) {
     };
 
     for (const line of lines) {
-      const sceneMatch = line.match(/(?:장면|scene)\s*[:#-]?\s*(\d+)/i);
-      if (sceneMatch) {
+      const sceneNo = parseSceneNumber(line);
+      if (sceneNo !== null) {
         pushCurrentIfValid();
-        current = { sceneNo: Number(sceneMatch[1]) };
+        current = { sceneNo };
         activeField = null;
         continue;
       }
 
-      const imagePromptMatch = line.match(
+      const labelLine = normalizeForLabelMatch(line);
+      const imagePromptMatch = labelLine.match(
         /^image\s*prompt(?:\s*[\(\[]\s*(en|ko)\s*[\)\]])?\s*[:：]\s*(.*)$/i
       );
       if (imagePromptMatch) {
+        if (hasExplicitSceneLabels && !current) continue;
         const lang = (imagePromptMatch[1] || '').toLowerCase();
         const promptValue = (imagePromptMatch[2] || '').trim();
         // EN Prompt를 새로 만나면 다음 장면 시작으로 본다.
-        if (current && (current.promptEn || current.promptKo) && (lang === 'en' || !lang)) {
+        if (
+          !hasExplicitSceneLabels &&
+          current &&
+          (current.promptEn || current.promptKo) &&
+          (lang === 'en' || !lang)
+        ) {
           pushCurrentIfValid();
         }
         ensureCurrent();
@@ -256,7 +429,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         continue;
       }
 
-      const ttsMatch = line.match(/en\s*tts\s*script\s*[:：]\s*(.*)$/i);
+      const ttsMatch = labelLine.match(/en\s*tts\s*script\s*[:：]\s*(.*)$/i);
       if (ttsMatch) {
         ensureCurrent();
         current!.tts = (ttsMatch[1] || '').trim();
@@ -264,7 +437,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         continue;
       }
 
-      const subMatch = line.match(/en\s*subtitle\s*[:：]\s*(.*)$/i);
+      const subMatch = labelLine.match(/en\s*subtitle\s*[:：]\s*(.*)$/i);
       if (subMatch) {
         ensureCurrent();
         current!.subtitle = (subMatch[1] || '').trim();
@@ -272,7 +445,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         continue;
       }
 
-      const motionMatch = line.match(/video\s*motion\s*prompt\s*[:：]\s*(.*)$/i);
+      const motionMatch = labelLine.match(/video\s*motion\s*prompt\s*[:：]\s*(.*)$/i);
       if (motionMatch) {
         ensureCurrent();
         current!.motion = (motionMatch[1] || '').trim();
@@ -280,7 +453,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         continue;
       }
 
-      const fxMatch = line.match(/fx\s*tag\s*[:：]\s*(.*)$/i);
+      const fxMatch = labelLine.match(/fx\s*tag\s*[:：]\s*(.*)$/i);
       if (fxMatch) {
         ensureCurrent();
         current!.fx = (fxMatch[1] || '').trim();
@@ -522,7 +695,17 @@ export default function Step4Analyze({ tabId }: Step4Props) {
   };
 
   const handleAnalyze = async () => {
-    if (!tab.script) {
+    const scriptFromStep1 = tab.script || '';
+    const rawSource = tab.rawScript || '';
+    const scriptPromptCount = countImagePromptsFromScript(scriptFromStep1);
+    const rawPromptCount = countImagePromptsFromScript(rawSource);
+    const scriptSceneCount = countRawSceneLabels(scriptFromStep1);
+    const rawSceneCount = countRawSceneLabels(rawSource);
+    const preferRawSource =
+      rawPromptCount > scriptPromptCount || (rawPromptCount === 0 && rawSceneCount > scriptSceneCount);
+    const analysisSource = preferRawSource ? rawSource : scriptFromStep1;
+
+    if (!analysisSource.trim()) {
       toast.error('먼저 STEP 1에서 대본을 분리해주세요.');
       return;
     }
@@ -543,8 +726,18 @@ export default function Step4Analyze({ tabId }: Step4Props) {
     setRetryMessage(null);
     setProgress(0);
     setProgressPhase('준비 중...');
-    const analyzeInput = optimizeAnalyzeInput(tab.script);
-    const targetSceneCount = estimateTargetSceneCount(tab.script);
+    const analyzeInput = optimizeAnalyzeInput(analysisSource);
+    const structuredScenes = extractStructuredScenes(analysisSource);
+    const embeddedPromptCount = countEmbeddedSceneHints(analysisSource);
+    const rawSceneLabelCount = countRawSceneLabels(analysisSource);
+    const targetSceneCount =
+      structuredScenes.length > 0
+        ? Math.min(MAX_SCENES_PER_ANALYZE, structuredScenes.length)
+        : embeddedPromptCount > 0
+        ? Math.min(MAX_SCENES_PER_ANALYZE, embeddedPromptCount)
+        : rawSceneLabelCount > 0
+        ? Math.min(MAX_SCENES_PER_ANALYZE, rawSceneLabelCount)
+        : estimateTargetSceneCount(analysisSource);
 
     try {
       // 중지 확인 헬퍼
@@ -574,15 +767,20 @@ export default function Step4Analyze({ tabId }: Step4Props) {
 
       checkAborted();
 
-      const structuredScenes = extractStructuredScenes(tab.script);
       if (structuredScenes.length > 0) {
-        const normalizedStructured = normalizeSceneCount(structuredScenes, targetSceneCount, tab.script);
+        const normalizedStructured = normalizeSceneCount(
+          structuredScenes,
+          structuredScenes.length,
+          analysisSource
+        );
         setScenes(tabId, normalizedStructured);
         updateTab(tabId, { currentStep: Math.max(tab.currentStep, 5) });
         setRetryMessage(null);
         setProgress(100);
         setProgressPhase('완료!');
-        toast.success(`대본 메타데이터에서 ${normalizedStructured.length}개 장면을 추출했습니다.`);
+        toast.success(
+          `대본의 Image Prompt를 자동 감지해 ${normalizedStructured.length}개 장면으로 분석했습니다.`
+        );
         setTimeout(() => {
           setProgress(0);
           setProgressPhase('');
@@ -709,7 +907,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
       if (scenes.length < Math.max(5, Math.floor(targetSceneCount * 0.5))) {
         toast.warning(`목표 ${targetSceneCount}개 대비 ${scenes.length}개만 생성되었습니다. 다시 시도하면 더 많이 생성될 수 있습니다.`);
       }
-      const normalizedScenes = normalizeSceneCount(scenes, targetSceneCount, tab.script);
+      const normalizedScenes = normalizeSceneCount(scenes, targetSceneCount, analysisSource);
       setScenes(tabId, normalizedScenes);
       updateTab(tabId, { currentStep: Math.max(tab.currentStep, 5) });
       setRetryMessage(null);
@@ -751,7 +949,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
           );
           const retryScenes = parseGeminiScenes(retryResult);
           if (retryScenes.length > 0) {
-            const normalizedRetryScenes = normalizeSceneCount(retryScenes, targetSceneCount, tab.script);
+            const normalizedRetryScenes = normalizeSceneCount(retryScenes, targetSceneCount, analysisSource);
             setScenes(tabId, normalizedRetryScenes);
             updateTab(tabId, { currentStep: Math.max(tab.currentStep, 5) });
             setRetryMessage(null);
@@ -768,7 +966,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
           console.warn('[Step4Analyze] timeout fallback retry failed:', retryErr);
         }
       }
-      const fallbackScenes = buildFallbackScenes(tab.script);
+      const fallbackScenes = buildFallbackScenes(analysisSource);
       if (fallbackScenes.length > 0) {
         setScenes(tabId, fallbackScenes);
         updateTab(tabId, { currentStep: Math.max(tab.currentStep, 5) });
@@ -808,6 +1006,16 @@ export default function Step4Analyze({ tabId }: Step4Props) {
   };
 
   const showProgress = tab.isAnalyzing || (progress > 0 && progress <= 100);
+  const scriptFromStep1 = tab.script || '';
+  const rawSource = tab.rawScript || '';
+  const scriptPromptCount = countImagePromptsFromScript(scriptFromStep1);
+  const rawPromptCount = countImagePromptsFromScript(rawSource);
+  const scriptSceneCount = countRawSceneLabels(scriptFromStep1);
+  const rawSceneCount = countRawSceneLabels(rawSource);
+  const preferRawSource =
+    rawPromptCount > scriptPromptCount || (rawPromptCount === 0 && rawSceneCount > scriptSceneCount);
+  const detectedSceneLabelCount = preferRawSource ? rawSceneCount : scriptSceneCount;
+  const detectedImagePromptCount = preferRawSource ? rawPromptCount : scriptPromptCount;
 
   return (
     <div className="space-y-4">
@@ -837,6 +1045,14 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         <p className="text-xs text-muted-foreground mt-1">
           분석 결과: 이미지 프롬프트(EN/KO) + TTS Script(EN) + Subtitle(EN, ①②③) + 모션 프롬프트
         </p>
+        <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground mt-1">
+          <span className="px-2 py-0.5 rounded bg-secondary border border-border">
+            감지 Scene 라벨: <span className="text-primary font-semibold">{detectedSceneLabelCount}</span>
+          </span>
+          <span className="px-2 py-0.5 rounded bg-secondary border border-border">
+            감지 Image Prompt: <span className="text-primary font-semibold">{detectedImagePromptCount}</span>
+          </span>
+        </div>
         {tab.serverReferenceMode === 'server' && tab.serverProjectId && isAuthenticated && (
           <p className="text-[11px] text-primary/90 mt-2 leading-relaxed">
             STEP 3에서 이 탭에 연결한 서버 프로젝트의 기획서·지식자료(텍스트·md·csv·json)가 있으면, 장면 분석 시 대본과 함께 AI에 전달됩니다.
@@ -856,7 +1072,11 @@ export default function Step4Analyze({ tabId }: Step4Props) {
             </Button>
           </div>
         ) : (
-          <Button onClick={handleAnalyze} disabled={!tab.script} className="w-full bg-primary hover:bg-primary/90 h-11">
+          <Button
+            onClick={handleAnalyze}
+            disabled={!(tab.script || tab.rawScript)}
+            className="w-full bg-primary hover:bg-primary/90 h-11"
+          >
             <Search className="w-4 h-4 mr-2" /> 장면 분석하기
           </Button>
         )}
