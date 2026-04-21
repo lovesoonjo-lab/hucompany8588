@@ -22,6 +22,10 @@ type AssetRow = {
 
 const TEXT_CONTEXT_MAX_PER_FILE = 10_000;
 const TEXT_CONTEXT_MAX_TOTAL = 18_000;
+// 이미지 프롬프트 기반 대본은 프롬프트 개수를 그대로 존중합니다.
+// 과도한 입력으로 인한 브라우저/메모리 폭주를 막기 위한 안전 상한만 둡니다.
+const MAX_SCENES_PER_ANALYZE = 300;
+const ANALYZE_BATCH_SIZE = 25;
 
 function isLikelyTextAsset(asset: AssetRow): boolean {
   const mime = (asset.mimeType || '').toLowerCase();
@@ -113,7 +117,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
     const embeddedSceneCount = countEmbeddedSceneHints(script);
     if (embeddedSceneCount > 0) {
       // 대본에 이미 장면/프롬프트 구조가 있으면 해당 개수를 우선 사용
-      return Math.min(150, Math.max(10, embeddedSceneCount));
+      return Math.min(MAX_SCENES_PER_ANALYZE, Math.max(1, embeddedSceneCount));
     }
 
     const cleaned = optimizeAnalyzeInput(script);
@@ -133,7 +137,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
     const bySentences = Math.ceil(sentenceCount * 0.75);
     const estimated = Math.max(byChars, byParagraphs, bySentences);
 
-    return Math.min(150, Math.max(10, estimated));
+    return Math.min(MAX_SCENES_PER_ANALYZE, Math.max(10, estimated));
   };
 
   const normalizeSubtitleScenes = (subtitleText: string): SubtitleScene[] => {
@@ -351,6 +355,53 @@ export default function Step4Analyze({ tabId }: Step4Props) {
     });
   };
 
+  const normalizeSceneCount = (
+    scenes: SceneSlot[],
+    desiredCount: number,
+    script: string
+  ): SceneSlot[] => {
+    const target = Math.max(1, Math.min(MAX_SCENES_PER_ANALYZE, desiredCount));
+    const trimmed = scenes.slice(0, target);
+    if (trimmed.length >= target) {
+      return trimmed.map((scene, idx) => ({ ...scene, id: idx + 1 }));
+    }
+
+    const fallbackPool = buildFallbackScenes(script);
+    const merged = [...trimmed];
+    for (const fallback of fallbackPool) {
+      if (merged.length >= target) break;
+      merged.push({ ...fallback, id: merged.length + 1 });
+    }
+
+    while (merged.length < target) {
+      const seed = merged[merged.length - 1] || buildFallbackScenes(script)[0];
+      if (!seed) break;
+      merged.push({
+        ...seed,
+        id: merged.length + 1,
+        promptKo: `${seed.promptKo || '장면'} (보강 ${merged.length + 1})`,
+      });
+    }
+
+    return merged.map((scene, idx) => ({ ...scene, id: idx + 1 }));
+  };
+
+  const splitScriptForBatches = (script: string, batchCount: number): string[] => {
+    const parts = script
+      .split(/\n{2,}/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+    if (parts.length === 0) return [script];
+    if (batchCount <= 1) return [parts.join('\n\n')];
+
+    const perBatch = Math.max(1, Math.ceil(parts.length / batchCount));
+    const batches: string[] = [];
+    for (let i = 0; i < parts.length; i += perBatch) {
+      batches.push(parts.slice(i, i + perBatch).join('\n\n'));
+    }
+    return batches;
+  };
+
   const parseGeminiScenes = (resultText: string): SceneSlot[] => {
     const jsonMatch = resultText.match(/\[[\s\S]*\]/);
     if (!jsonMatch) {
@@ -446,6 +497,14 @@ export default function Step4Analyze({ tabId }: Step4Props) {
     // AbortController 생성
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
+    // 전체 분석(1차 + 경량 재시도 포함) 상한 시간
+    const ANALYZE_HARD_TIMEOUT_MS = 210000;
+    const hardTimeoutId = window.setTimeout(() => {
+      if (abortControllerRef.current === abortController) {
+        abortController.abort();
+        abortControllerRef.current = null;
+      }
+    }, ANALYZE_HARD_TIMEOUT_MS);
 
     updateTab(tabId, { isAnalyzing: true });
     setRetryMessage(null);
@@ -484,12 +543,13 @@ export default function Step4Analyze({ tabId }: Step4Props) {
 
       const structuredScenes = extractStructuredScenes(tab.script);
       if (structuredScenes.length > 0) {
-        setScenes(tabId, structuredScenes);
+        const normalizedStructured = normalizeSceneCount(structuredScenes, targetSceneCount, tab.script);
+        setScenes(tabId, normalizedStructured);
         updateTab(tabId, { currentStep: Math.max(tab.currentStep, 5) });
         setRetryMessage(null);
         setProgress(100);
         setProgressPhase('완료!');
-        toast.success(`대본 메타데이터에서 ${structuredScenes.length}개 장면을 추출했습니다.`);
+        toast.success(`대본 메타데이터에서 ${normalizedStructured.length}개 장면을 추출했습니다.`);
         setTimeout(() => {
           setProgress(0);
           setProgressPhase('');
@@ -497,7 +557,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         return;
       }
 
-      let userPromptBody = `대본:\n${analyzeInput}`;
+      let projectContext = '';
       if (
         tab.serverReferenceMode === 'server' &&
         tab.serverProjectId &&
@@ -509,62 +569,120 @@ export default function Step4Analyze({ tabId }: Step4Props) {
             tab.serverProjectId
           );
           if (ctx.trim()) {
-            userPromptBody += `\n\n[프로젝트 참고 자료 — 기획서·지식자료]\n다음은 동일 프로젝트에 업로드된 참고 문서입니다. 대본과 모순되지 않게 톤·사실·용어를 맞추고 장면을 설계하세요.\n\n${ctx}`;
+            projectContext = `\n\n[프로젝트 참고 자료 — 기획서·지식자료]\n다음은 동일 프로젝트에 업로드된 참고 문서입니다. 대본과 모순되지 않게 톤·사실·용어를 맞추고 장면을 설계하세요.\n\n${ctx}`;
           }
         } catch {
           toast.warning('프로젝트 문서를 불러오지 못했습니다. 대본만으로 분석합니다.');
         }
       }
-
-      const result = await callGemini(
-        settings.geminiApiKey, '',
-        userPromptBody,
-        PROMPTS.analyzeScenes(
-          tab.selectedAspectRatio || tab.aspectRatio,
-          tab.imageStyle || 'natural',
-          targetSceneCount
-        ),
-        progressCallbacks,
-        abortController.signal
-      );
-
-      checkAborted();
       let scenes: SceneSlot[] = [];
-      try {
-        scenes = parseGeminiScenes(result);
-      } catch (parseErr) {
-        // 1차 분석이 타임아웃/파싱 실패한 경우, 입력과 장면 수를 줄여 2차 경량 재시도
-        const lightInput = analyzeInput.slice(0, 7000);
-        const reducedSceneCount = Math.max(10, Math.min(24, Math.ceil(targetSceneCount * 0.55)));
-        toast.warning(`분석 응답이 길어 경량 모드(${reducedSceneCount}장면)로 재시도합니다.`);
-        const retryResult = await callGemini(
-          settings.geminiApiKey,
-          '',
-          `대본(요약 분석용):\n${lightInput}`,
+
+      const useBatch = targetSceneCount > ANALYZE_BATCH_SIZE;
+      if (useBatch) {
+        const batchCount = Math.ceil(targetSceneCount / ANALYZE_BATCH_SIZE);
+        const scriptBatches = splitScriptForBatches(analyzeInput, batchCount);
+        let accumulatedTarget = 0;
+        for (let i = 0; i < scriptBatches.length; i++) {
+          checkAborted();
+          const remaining = targetSceneCount - accumulatedTarget;
+          if (remaining <= 0) break;
+          const batchTarget = Math.min(ANALYZE_BATCH_SIZE, remaining);
+          setProgressPhase(`분석 배치 ${i + 1}/${scriptBatches.length} 처리 중...`);
+          setProgress(Math.min(95, Math.max(progress, Math.round((i / scriptBatches.length) * 90))));
+
+          const batchPrompt =
+            `대본(배치 ${i + 1}/${scriptBatches.length}):\n${scriptBatches[i]}` +
+            (i === 0 ? projectContext : '');
+
+          try {
+            const batchResult = await callGemini(
+              settings.geminiApiKey,
+              '',
+              batchPrompt,
+              PROMPTS.analyzeScenes(
+                tab.selectedAspectRatio || tab.aspectRatio,
+                tab.imageStyle || 'natural',
+                batchTarget
+              ),
+              progressCallbacks,
+              abortController.signal
+            );
+            const parsedBatch = parseGeminiScenes(batchResult).slice(0, batchTarget);
+            scenes.push(...parsedBatch);
+            accumulatedTarget += parsedBatch.length;
+          } catch (batchErr) {
+            const lightInput = scriptBatches[i].slice(0, 2400);
+            const reducedSceneCount = Math.max(6, Math.min(12, batchTarget));
+            toast.warning(`배치 ${i + 1} 지연으로 빠른 모드(${reducedSceneCount}장면) 재시도합니다.`);
+            const retryResult = await callGemini(
+              settings.geminiApiKey,
+              '',
+              `대본(요약 배치 ${i + 1}/${scriptBatches.length}):\n${lightInput}`,
+              PROMPTS.analyzeScenes(
+                tab.selectedAspectRatio || tab.aspectRatio,
+                tab.imageStyle || 'natural',
+                reducedSceneCount
+              ),
+              undefined,
+              abortController.signal
+            );
+            const parsedRetryBatch = parseGeminiScenes(retryResult).slice(0, reducedSceneCount);
+            scenes.push(...parsedRetryBatch);
+            accumulatedTarget += parsedRetryBatch.length;
+            console.warn('[Step4Analyze] batch retry used:', batchErr);
+          }
+        }
+      } else {
+        const userPromptBody = `대본:\n${analyzeInput}${projectContext}`;
+        const result = await callGemini(
+          settings.geminiApiKey, '',
+          userPromptBody,
           PROMPTS.analyzeScenes(
             tab.selectedAspectRatio || tab.aspectRatio,
             tab.imageStyle || 'natural',
-            reducedSceneCount
+            targetSceneCount
           ),
           progressCallbacks,
           abortController.signal
         );
         checkAborted();
-        scenes = parseGeminiScenes(retryResult);
-        if (parseErr instanceof Error) {
-          console.warn('[Step4Analyze] Primary parse failed, fallback succeeded:', parseErr.message);
+        try {
+          scenes = parseGeminiScenes(result);
+        } catch (parseErr) {
+          // 1차 분석 파싱 실패 시 경량 재시도
+          const lightInput = analyzeInput.slice(0, 3200);
+          const reducedSceneCount = Math.max(8, Math.min(16, Math.ceil(targetSceneCount * 0.35)));
+          toast.warning(`분석 응답이 길어 경량 모드(${reducedSceneCount}장면)로 재시도합니다.`);
+          const retryResult = await callGemini(
+            settings.geminiApiKey,
+            '',
+            `대본(요약 분석용):\n${lightInput}`,
+            PROMPTS.analyzeScenes(
+              tab.selectedAspectRatio || tab.aspectRatio,
+              tab.imageStyle || 'natural',
+              reducedSceneCount
+            ),
+            progressCallbacks,
+            abortController.signal
+          );
+          checkAborted();
+          scenes = parseGeminiScenes(retryResult);
+          if (parseErr instanceof Error) {
+            console.warn('[Step4Analyze] Primary parse failed, fallback succeeded:', parseErr.message);
+          }
         }
       }
 
       if (scenes.length < Math.max(5, Math.floor(targetSceneCount * 0.5))) {
         toast.warning(`목표 ${targetSceneCount}개 대비 ${scenes.length}개만 생성되었습니다. 다시 시도하면 더 많이 생성될 수 있습니다.`);
       }
-      setScenes(tabId, scenes);
+      const normalizedScenes = normalizeSceneCount(scenes, targetSceneCount, tab.script);
+      setScenes(tabId, normalizedScenes);
       updateTab(tabId, { currentStep: Math.max(tab.currentStep, 5) });
       setRetryMessage(null);
       setProgress(100);
       setProgressPhase('완료!');
-      toast.success(`${scenes.length}개의 장면이 분석되었습니다.`);
+      toast.success(`${normalizedScenes.length}개의 장면이 분석되었습니다.`);
 
       setTimeout(() => {
         setProgress(0);
@@ -583,9 +701,9 @@ export default function Step4Analyze({ tabId }: Step4Props) {
 
       if (isTimeoutLike) {
         try {
-          const lightInput = analyzeInput.slice(0, 7000);
-          const reducedSceneCount = Math.max(10, Math.min(24, Math.ceil(targetSceneCount * 0.5)));
-          toast.warning(`네트워크/시간 제한으로 경량 모드(${reducedSceneCount}장면) 재시도 중입니다.`);
+          const lightInput = analyzeInput.slice(0, 3200);
+          const reducedSceneCount = Math.max(8, Math.min(16, Math.ceil(targetSceneCount * 0.3)));
+          toast.warning(`네트워크 지연으로 빠른 모드(${reducedSceneCount}장면) 분석을 진행합니다.`);
           const retryResult = await callGemini(
             settings.geminiApiKey,
             '',
@@ -600,12 +718,13 @@ export default function Step4Analyze({ tabId }: Step4Props) {
           );
           const retryScenes = parseGeminiScenes(retryResult);
           if (retryScenes.length > 0) {
-            setScenes(tabId, retryScenes);
+            const normalizedRetryScenes = normalizeSceneCount(retryScenes, targetSceneCount, tab.script);
+            setScenes(tabId, normalizedRetryScenes);
             updateTab(tabId, { currentStep: Math.max(tab.currentStep, 5) });
             setRetryMessage(null);
             setProgress(100);
             setProgressPhase('완료!');
-            toast.success(`경량 재시도로 ${retryScenes.length}개 장면 분석을 완료했습니다.`);
+            toast.success(`경량 재시도로 ${normalizedRetryScenes.length}개 장면 분석을 완료했습니다.`);
             setTimeout(() => {
               setProgress(0);
               setProgressPhase('');
@@ -623,7 +742,11 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         setRetryMessage(null);
         setProgress(100);
         setProgressPhase('완료!');
-        toast.warning(`AI 분석 실패로 기본 장면 ${fallbackScenes.length}개를 생성했습니다: ${errMsg}`);
+        if (isTimeoutLike) {
+          toast.info(`응답 지연으로 기본 장면 ${fallbackScenes.length}개를 빠르게 구성했습니다. STEP5에서 바로 작업을 이어갈 수 있습니다.`);
+        } else {
+          toast.warning(`AI 분석 실패로 기본 장면 ${fallbackScenes.length}개를 생성했습니다: ${errMsg}`);
+        }
         setTimeout(() => {
           setProgress(0);
           setProgressPhase('');
@@ -635,6 +758,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         toast.error(`장면 분석 실패: ${err.message}`);
       }
     } finally {
+      window.clearTimeout(hardTimeoutId);
       updateTab(tabId, { isAnalyzing: false });
       abortControllerRef.current = null;
       setRetryMessage(null);

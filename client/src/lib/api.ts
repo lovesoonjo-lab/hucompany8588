@@ -45,8 +45,8 @@ function createProgressSimulator(onProgress?: (percent: number, phase: string) =
       if (currentPercent < 20) { currentPercent += Math.random() * 6 + 3; }
       else if (currentPercent < 50) { currentPercent += Math.random() * 3 + 1.5; }
       else if (currentPercent < 75) { currentPercent += Math.random() * 2 + 0.5; }
-      else if (currentPercent < 92) { currentPercent += Math.random() * 0.8 + 0.2; }
-      currentPercent = Math.min(currentPercent, 92);
+      else if (currentPercent < 97) { currentPercent += Math.random() * 0.6 + 0.15; }
+      currentPercent = Math.min(currentPercent, 97);
       const rounded = Math.round(currentPercent);
       onProgress(rounded, getPhase(rounded));
     }, 400);
@@ -62,9 +62,9 @@ function createProgressSimulator(onProgress?: (percent: number, phase: string) =
 // callGeminiViaServer: tRPC 클라이언트를 직접 사용할 수 없으므로 (React 컴포넌트 외부),
 // fetch를 통해 서버 tRPC 엔드포인트를 직접 호출합니다.
 // 무한 로딩처럼 보이지 않도록 재시도 횟수/대기 시간을 낮춥니다.
-const MAX_RETRIES = 1;
+const MAX_RETRIES = 2;
 const BASE_RETRY_DELAY_MS = 2500;
-const REQUEST_TIMEOUT_MS = 90000;
+const REQUEST_TIMEOUT_MS = 180000;
 
 function getRetryDelay(attempt: number): number {
   return BASE_RETRY_DELAY_MS * Math.pow(1.5, attempt - 1);
