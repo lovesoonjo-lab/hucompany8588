@@ -351,6 +351,71 @@ export default function Step4Analyze({ tabId }: Step4Props) {
     });
   };
 
+  const parseGeminiScenes = (resultText: string): SceneSlot[] => {
+    const jsonMatch = resultText.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) {
+      throw new Error('AI 응답이 너무 길어서 잘렸습니다. 대본을 더 짧게 줄이거나 다시 시도해주세요.');
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonMatch[0]);
+    } catch {
+      throw new Error('AI 응답 형식 오류입니다. 다시 시도해주세요.');
+    }
+
+    const VALID_EFFECTS: EffectType[] = [
+      'fade-in', 'fade-out', 'fade-in-hold', 'zoom-in', 'zoom-in-slow',
+      'zoom-out', 'hold', 'pan-left-to-right', 'pan-right-to-left', 'shake'
+    ];
+
+    return parsed.map((scene: any, i: number) => {
+      const rawEffect = scene.effectType || 'zoom-in';
+      const effectType: EffectType = VALID_EFFECTS.includes(rawEffect as EffectType)
+        ? (rawEffect as EffectType)
+        : 'zoom-in';
+
+      const subtitleText = scene.subtitleEn || '';
+      const subtitleScenes: SubtitleScene[] = [];
+      if (subtitleText) {
+        const parts = subtitleText.split(/[①②③④⑤⑥⑦⑧⑨⑩]/).filter((s: string) => s.trim());
+        parts.forEach((part: string, idx: number) => {
+          subtitleScenes.push({ id: idx + 1, text: part.trim() });
+        });
+        if (subtitleScenes.length === 0) {
+          subtitleScenes.push({ id: 1, text: subtitleText.trim() });
+        }
+      }
+
+      return {
+        id: i + 1,
+        promptEn: scene.promptEn || '',
+        promptKo: scene.promptKo || '',
+        effectType,
+        effectDuration: scene.effectDuration || 2.5,
+        videoMotionPrompt: scene.videoMotionPrompt || '',
+        imageUrl: null,
+        videoUrl: null,
+        isGeneratingImage: false,
+        isGeneratingVideo: false,
+        ttsScript: scene.ttsScript || '',
+        subtitleScenes,
+        audioUrl: null,
+        audioDuration: 0,
+        isGeneratingAudio: false,
+        voiceId: 'default',
+        speechRate: 1.0,
+        subtitleLines: 2,
+        subtitleSize: 48,
+        subtitlePosition: 90,
+        subtitleFont: 'Pretendard',
+        subtitleColor: '#FFFFFF',
+        subtitleOutline: true,
+        subtitleOutlineWidth: 2,
+        subtitleBg: 'none' as const,
+      };
+    });
+  };
+
   // 컴포넌트 마운트 시 isAnalyzing이 true로 잔류해 있으면 리셋합니다.
   useEffect(() => {
     if (tab.isAnalyzing) {
@@ -386,6 +451,8 @@ export default function Step4Analyze({ tabId }: Step4Props) {
     setRetryMessage(null);
     setProgress(0);
     setProgressPhase('준비 중...');
+    const analyzeInput = optimizeAnalyzeInput(tab.script);
+    const targetSceneCount = estimateTargetSceneCount(tab.script);
 
     try {
       // 중지 확인 헬퍼
@@ -430,9 +497,6 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         return;
       }
 
-      const analyzeInput = optimizeAnalyzeInput(tab.script);
-      const targetSceneCount = estimateTargetSceneCount(tab.script);
-
       let userPromptBody = `대본:\n${analyzeInput}`;
       if (
         tab.serverReferenceMode === 'server' &&
@@ -465,77 +529,32 @@ export default function Step4Analyze({ tabId }: Step4Props) {
       );
 
       checkAborted();
-
-      // Extract JSON array from response
-      const jsonMatch = result.match(/\[[\s\S]*\]/);
-      if (!jsonMatch) {
-        throw new Error('AI 응답이 너무 길어서 잘렸습니다. 대본을 더 짧게 줄이거나 다시 시도해주세요.');
-      }
-      let parsed;
+      let scenes: SceneSlot[] = [];
       try {
-        parsed = JSON.parse(jsonMatch[0]);
-      } catch {
-        throw new Error('AI 응답 형식 오류입니다. 다시 시도해주세요.');
-      }
-
-      checkAborted();
-
-      // 유효한 effectType 목록
-      const VALID_EFFECTS: EffectType[] = [
-        'fade-in', 'fade-out', 'fade-in-hold', 'zoom-in', 'zoom-in-slow',
-        'zoom-out', 'hold', 'pan-left-to-right', 'pan-right-to-left', 'shake'
-      ];
-
-      const scenes: SceneSlot[] = parsed.map((scene: any, i: number) => {
-        // effectType 유효성 검증 - AI가 잘못된 값을 반환할 경우 기본값으로 fallback
-        const rawEffect = scene.effectType || 'zoom-in';
-        const effectType: EffectType = VALID_EFFECTS.includes(rawEffect as EffectType)
-          ? (rawEffect as EffectType)
-          : 'zoom-in';
-
-        // Parse subtitle scenes from ①②③ format
-        const subtitleText = scene.subtitleEn || '';
-        const subtitleScenes: SubtitleScene[] = [];
-        if (subtitleText) {
-          const parts = subtitleText.split(/[①②③④⑤⑥⑦⑧⑨⑩]/).filter((s: string) => s.trim());
-          parts.forEach((part: string, idx: number) => {
-            subtitleScenes.push({ id: idx + 1, text: part.trim() });
-          });
-          if (subtitleScenes.length === 0) {
-            subtitleScenes.push({ id: 1, text: subtitleText.trim() });
-          }
+        scenes = parseGeminiScenes(result);
+      } catch (parseErr) {
+        // 1차 분석이 타임아웃/파싱 실패한 경우, 입력과 장면 수를 줄여 2차 경량 재시도
+        const lightInput = analyzeInput.slice(0, 7000);
+        const reducedSceneCount = Math.max(10, Math.min(24, Math.ceil(targetSceneCount * 0.55)));
+        toast.warning(`분석 응답이 길어 경량 모드(${reducedSceneCount}장면)로 재시도합니다.`);
+        const retryResult = await callGemini(
+          settings.geminiApiKey,
+          '',
+          `대본(요약 분석용):\n${lightInput}`,
+          PROMPTS.analyzeScenes(
+            tab.selectedAspectRatio || tab.aspectRatio,
+            tab.imageStyle || 'natural',
+            reducedSceneCount
+          ),
+          progressCallbacks,
+          abortController.signal
+        );
+        checkAborted();
+        scenes = parseGeminiScenes(retryResult);
+        if (parseErr instanceof Error) {
+          console.warn('[Step4Analyze] Primary parse failed, fallback succeeded:', parseErr.message);
         }
-
-        return {
-          id: i + 1,
-          promptEn: scene.promptEn || '',
-          promptKo: scene.promptKo || '',
-          effectType,
-          effectDuration: scene.effectDuration || 2.5,
-          videoMotionPrompt: scene.videoMotionPrompt || '',
-          imageUrl: null,
-          videoUrl: null,
-          isGeneratingImage: false,
-          isGeneratingVideo: false,
-          // TTS & Subtitle
-          ttsScript: scene.ttsScript || '',
-          subtitleScenes,
-          audioUrl: null,
-          audioDuration: 0,
-          isGeneratingAudio: false,
-          voiceId: 'default',
-          speechRate: 1.0,
-          // Subtitle style defaults
-          subtitleLines: 2,
-          subtitleSize: 48,
-          subtitlePosition: 90,
-          subtitleFont: 'Pretendard',
-          subtitleColor: '#FFFFFF',
-          subtitleOutline: true,
-          subtitleOutlineWidth: 2,
-          subtitleBg: 'none' as const,
-        };
-      });
+      }
 
       if (scenes.length < Math.max(5, Math.floor(targetSceneCount * 0.5))) {
         toast.warning(`목표 ${targetSceneCount}개 대비 ${scenes.length}개만 생성되었습니다. 다시 시도하면 더 많이 생성될 수 있습니다.`);
@@ -556,6 +575,47 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         // 이미 handleStopAnalyze에서 처리됨
         return;
       }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const isTimeoutLike =
+        errMsg.includes('요청 시간이 초과되었습니다') ||
+        errMsg.toLowerCase().includes('timeout') ||
+        errMsg.includes('503');
+
+      if (isTimeoutLike) {
+        try {
+          const lightInput = analyzeInput.slice(0, 7000);
+          const reducedSceneCount = Math.max(10, Math.min(24, Math.ceil(targetSceneCount * 0.5)));
+          toast.warning(`네트워크/시간 제한으로 경량 모드(${reducedSceneCount}장면) 재시도 중입니다.`);
+          const retryResult = await callGemini(
+            settings.geminiApiKey,
+            '',
+            `대본(요약 분석용):\n${lightInput}`,
+            PROMPTS.analyzeScenes(
+              tab.selectedAspectRatio || tab.aspectRatio,
+              tab.imageStyle || 'natural',
+              reducedSceneCount
+            ),
+            undefined,
+            abortController.signal
+          );
+          const retryScenes = parseGeminiScenes(retryResult);
+          if (retryScenes.length > 0) {
+            setScenes(tabId, retryScenes);
+            updateTab(tabId, { currentStep: Math.max(tab.currentStep, 5) });
+            setRetryMessage(null);
+            setProgress(100);
+            setProgressPhase('완료!');
+            toast.success(`경량 재시도로 ${retryScenes.length}개 장면 분석을 완료했습니다.`);
+            setTimeout(() => {
+              setProgress(0);
+              setProgressPhase('');
+            }, 2000);
+            return;
+          }
+        } catch (retryErr) {
+          console.warn('[Step4Analyze] timeout fallback retry failed:', retryErr);
+        }
+      }
       const fallbackScenes = buildFallbackScenes(tab.script);
       if (fallbackScenes.length > 0) {
         setScenes(tabId, fallbackScenes);
@@ -563,7 +623,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         setRetryMessage(null);
         setProgress(100);
         setProgressPhase('완료!');
-        toast.warning(`AI 분석 실패로 기본 장면 ${fallbackScenes.length}개를 생성했습니다: ${err.message}`);
+        toast.warning(`AI 분석 실패로 기본 장면 ${fallbackScenes.length}개를 생성했습니다: ${errMsg}`);
         setTimeout(() => {
           setProgress(0);
           setProgressPhase('');
