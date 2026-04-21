@@ -1,0 +1,22 @@
+# Project TODO
+
+- [x] 기존 클라이언트 컴포넌트 복사 (ProgressStepper, SettingsModal, Sidebar, TabWorkflow)
+- [x] Steps 컴포넌트 복사 (Step1~Step5, SceneSlotCard)
+- [x] Lib 파일 복사 (api.ts, store.ts)
+- [x] 페이지 복사 (Home.tsx, ProjectManager.tsx)
+- [x] shared/types.ts 복사
+- [x] App.tsx 라우팅 업데이트 (/projects 경로 추가)
+- [x] index.css 다크 테마 스타일 복사
+- [x] ThemeProvider defaultTheme="dark" 설정
+- [x] 서버 routers.ts 전체 통합 (project, gemini, supertone, video, asset, validateApiKey)
+- [x] Supertone TTS API 엔드포인트 수정 (/v1/text-to-speech/{voice_id}?output_format=mp3)
+- [x] voiceId 'default' 문제 해결 (클라이언트 측 자동 선택 로직)
+- [x] 언어 자동 감지 로직 포함
+- [x] invokeLLM 시그니처 호환성 수정 (두 번째 인자 제거)
+- [x] DB 스키마 마이그레이션 (contentProjects, projectAssets 테이블 추가)
+- [x] db.ts 헬퍼 함수 전체 통합
+- [x] 추가 의존성 설치 (zustand, pdfjs-dist)
+- [x] TypeScript 타입 체크 통과 (0 errors)
+- [x] 프로덕션 빌드 성공
+- [x] Vitest 테스트 작성 및 통과 (5 tests passed)
+- [x] Manus OAuth 인증 연동 (환경 변수 자동 적용)
