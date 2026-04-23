@@ -30,6 +30,7 @@ export type AspectRatio = '16:9' | '9:16' | '1:1' | '4:3' | '3:4';
 
 export type ImageStyle =
   | 'reference' | 'rich-portrait' | 'natural' | 'editorial' | 'illustration'
+  | 'character-real-bg'
   | '3d-character' | 'risograph' | 'pixel-art' | 'oil-painting' | 'korean-traditional'
   | 'cartoon' | 'pop-surreal' | 'vibrant-film' | 'fashion-photo' | 'glitch-collage'
   | 'retro-film' | 'cross-process' | 'wild-landscape' | 'bold-line' | 'watercolor';
@@ -40,6 +41,7 @@ export const IMAGE_STYLE_LABELS: Record<ImageStyle, string> = {
   'natural': '내추럴',
   'editorial': '에디토리얼',
   'illustration': '일러스트',
+  'character-real-bg': '캐릭터+실사배경',
   '3d-character': '3D 캐릭터',
   'risograph': '리소그래프',
   'pixel-art': '픽셀아트',
@@ -73,6 +75,12 @@ export interface SceneSlot {
   videoUrl: string | null;
   isGeneratingImage: boolean;
   isGeneratingVideo: boolean;
+  imageTaskId?: string | null;
+  imageTaskState?: 'idle' | 'waiting' | 'queuing' | 'generating' | 'success' | 'fail';
+  imageError?: string | null;
+  videoTaskId?: string | null;
+  videoTaskState?: 'idle' | 'waiting' | 'queuing' | 'generating' | 'success' | 'fail';
+  videoError?: string | null;
   // TTS & Subtitle (v3)
   ttsScript: string;
   subtitleScenes: SubtitleScene[];
@@ -131,9 +139,26 @@ export interface TabData {
   isBatchGeneratingAudios: boolean;
   isGeneratingFinalVideo: boolean;
   finalVideoUrl: string | null;
+  thumbnailPrompt: string;
+  thumbnailCandidates: string[];
+  selectedThumbnailUrl: string | null;
+  isGeneratingThumbnails: boolean;
+  thumbnailAspectRatio: AspectRatio;
+  thumbnailPhraseCount: 3 | 4 | 5;
+  thumbnailPhraseCandidates: string[];
+  selectedThumbnailPhrase: string | null;
+  thumbnailSceneCandidates: number[];
+  selectedThumbnailSceneId: number | null;
+  thumbnailProgress: number;
+  thumbnailStatus: string;
+  thumbnailError: string | null;
+  analyzeImagePromptLang: 'en' | 'ko';
+  analyzeTtsLang: 'en' | 'ko';
+  analyzeSubtitleLang: 'en' | 'ko';
+  analyzeMotionPromptLang: 'en' | 'ko';
   currentStep: number;
   // STEP 5 sub-tab
-  step5Tab: 'images' | 'audio' | 'render';
+  step5Tab: 'images' | 'audio' | 'render' | 'thumbnail';
 }
 
 export interface Project {
@@ -226,6 +251,23 @@ const createDefaultTab = (id: string, label: string, aspectRatio: AspectRatio): 
   isBatchGeneratingAudios: false,
   isGeneratingFinalVideo: false,
   finalVideoUrl: null,
+  thumbnailPrompt: '',
+  thumbnailCandidates: [],
+  selectedThumbnailUrl: null,
+  isGeneratingThumbnails: false,
+  thumbnailAspectRatio: '16:9',
+  thumbnailPhraseCount: 3,
+  thumbnailPhraseCandidates: [],
+  selectedThumbnailPhrase: null,
+  thumbnailSceneCandidates: [],
+  selectedThumbnailSceneId: null,
+  thumbnailProgress: 0,
+  thumbnailStatus: '',
+  thumbnailError: null,
+  analyzeImagePromptLang: 'en',
+  analyzeTtsLang: 'en',
+  analyzeSubtitleLang: 'en',
+  analyzeMotionPromptLang: 'en',
   currentStep: 1,
   step5Tab: 'images',
 });
@@ -273,6 +315,44 @@ const loadSettings = (): SettingsState => {
 };
 
 // Load projects from localStorage
+const normalizeTabData = (tab: TabData): TabData => {
+  const defaultTab = createDefaultTab(
+    tab.id,
+    tab.label || (tab.id === 'main' ? '메인 영상' : `쇼츠 ${tab.id.replace('shorts', '')}`),
+    (tab.aspectRatio || defaultAspectForTab(tab.id)) as AspectRatio
+  );
+  const nextStep5Tab =
+    tab.step5Tab === 'images' || tab.step5Tab === 'audio' || tab.step5Tab === 'render' || tab.step5Tab === 'thumbnail'
+      ? tab.step5Tab
+      : 'images';
+  const nextPhraseCount =
+    tab.thumbnailPhraseCount === 3 || tab.thumbnailPhraseCount === 4 || tab.thumbnailPhraseCount === 5
+      ? tab.thumbnailPhraseCount
+      : 3;
+  const nextImagePromptLang = tab.analyzeImagePromptLang === 'ko' ? 'ko' : 'en';
+  const nextTtsLang = tab.analyzeTtsLang === 'ko' ? 'ko' : 'en';
+  const nextSubtitleLang = tab.analyzeSubtitleLang === 'ko' ? 'ko' : 'en';
+  const nextMotionPromptLang = tab.analyzeMotionPromptLang === 'ko' ? 'ko' : 'en';
+
+  return {
+    ...defaultTab,
+    ...tab,
+    referenceImages: Array.isArray(tab.referenceImages) ? tab.referenceImages : [],
+    thumbnailCandidates: Array.isArray((tab as any).thumbnailCandidates) ? (tab as any).thumbnailCandidates : [],
+    thumbnailPhraseCount: nextPhraseCount,
+    thumbnailPhraseCandidates: Array.isArray((tab as any).thumbnailPhraseCandidates) ? (tab as any).thumbnailPhraseCandidates : [],
+    thumbnailSceneCandidates: Array.isArray((tab as any).thumbnailSceneCandidates) ? (tab as any).thumbnailSceneCandidates : [],
+    thumbnailProgress: typeof (tab as any).thumbnailProgress === 'number' ? (tab as any).thumbnailProgress : 0,
+    thumbnailStatus: typeof (tab as any).thumbnailStatus === 'string' ? (tab as any).thumbnailStatus : '',
+    thumbnailError: typeof (tab as any).thumbnailError === 'string' ? (tab as any).thumbnailError : null,
+    analyzeImagePromptLang: nextImagePromptLang,
+    analyzeTtsLang: nextTtsLang,
+    analyzeSubtitleLang: nextSubtitleLang,
+    analyzeMotionPromptLang: nextMotionPromptLang,
+    step5Tab: nextStep5Tab,
+  };
+};
+
 const migrateProjectTabs = (project: Project): Project => {
   const expectedTabs = [
     { id: 'main', label: '메인 영상', aspectRatio: '16:9' as AspectRatio },
@@ -284,12 +364,14 @@ const migrateProjectTabs = (project: Project): Project => {
     { id: 'shorts6', label: '쇼츠 6', aspectRatio: '9:16' as AspectRatio },
     { id: 'shorts7', label: '쇼츠 7', aspectRatio: '9:16' as AspectRatio },
   ];
-  if (project.tabs.length >= expectedTabs.length) return project;
+  if (project.tabs.length >= expectedTabs.length) {
+    return { ...project, tabs: project.tabs.map(normalizeTabData) };
+  }
   const existingIds = new Set(project.tabs.map((t) => t.id));
   const missingTabs = expectedTabs
     .filter((et) => !existingIds.has(et.id))
     .map((et) => createDefaultTab(et.id, et.label, et.aspectRatio));
-  return { ...project, tabs: [...project.tabs, ...missingTabs] };
+  return { ...project, tabs: [...project.tabs.map(normalizeTabData), ...missingTabs] };
 };
 
 const loadProjects = (): Project[] => {

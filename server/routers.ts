@@ -14,6 +14,122 @@ import * as path from "path";
 import * as os from "os";
 
 const execFileAsync = promisify(execFile);
+const KIE_BASE_URL = "https://api.kie.ai";
+type KieTaskState = "waiting" | "queuing" | "generating" | "success" | "fail";
+
+function getKieHeaders(apiKey: string) {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey}`,
+  };
+}
+
+function normalizeKieState(raw: string | undefined): KieTaskState {
+  if (!raw) return "waiting";
+  const value = raw.toLowerCase();
+  if (value === "success" || value === "succeed" || value === "completed") return "success";
+  if (value === "fail" || value === "failed" || value === "error") return "fail";
+  if (value === "queuing" || value === "queueing" || value === "queued") return "queuing";
+  if (value === "generating" || value === "processing" || value === "running") return "generating";
+  return "waiting";
+}
+
+async function kieCreateTask(apiKey: string, payload: Record<string, unknown>) {
+  const res = await fetch(`${KIE_BASE_URL}/api/v1/jobs/createTask`, {
+    method: "POST",
+    headers: getKieHeaders(apiKey),
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  const code = typeof data?.code === "string" ? Number(data.code) : data?.code;
+  if (!res.ok || (typeof code === "number" && code !== 200)) {
+    throw new Error(data?.msg || data?.message || `Kie createTask 오류: ${res.status}`);
+  }
+  const taskId = data?.data?.taskId || data?.data?.task_id;
+  if (!taskId) throw new Error("Kie createTask 응답에 taskId가 없습니다.");
+  return { taskId: String(taskId), raw: data };
+}
+
+async function kieGetTaskRecordInfo(apiKey: string, taskId: string) {
+  const url = new URL(`${KIE_BASE_URL}/api/v1/jobs/recordInfo`);
+  url.searchParams.set("taskId", taskId);
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  const code = typeof data?.code === "string" ? Number(data.code) : data?.code;
+  if (!res.ok || (typeof code === "number" && code !== 200)) {
+    throw new Error(data?.msg || `Kie task 조회 오류: ${res.status}`);
+  }
+  return data;
+}
+
+function extractResultUrlFromRecordInfo(data: any): string | null {
+  const resultJsonRaw = data?.data?.resultJson;
+  if (typeof resultJsonRaw === "string") {
+    try {
+      const parsed = JSON.parse(resultJsonRaw);
+      if (Array.isArray(parsed?.resultUrls) && parsed.resultUrls.length > 0) {
+        return parsed.resultUrls[0];
+      }
+      if (Array.isArray(parsed?.images) && parsed.images.length > 0) {
+        return parsed.images[0]?.url || parsed.images[0];
+      }
+      if (parsed?.video_url) return parsed.video_url;
+      if (parsed?.videoUrl) return parsed.videoUrl;
+      if (parsed?.image_url) return parsed.image_url;
+      if (parsed?.imageUrl) return parsed.imageUrl;
+      if (parsed?.output?.image_url) return parsed.output.image_url;
+      if (parsed?.output?.video_url) return parsed.output.video_url;
+    } catch {}
+  }
+  if (Array.isArray(data?.data?.resultUrls) && data.data.resultUrls.length > 0) {
+    return data.data.resultUrls[0];
+  }
+  if (Array.isArray(data?.data?.images) && data.data.images.length > 0) {
+    return data.data.images[0]?.url || data.data.images[0];
+  }
+  if (data?.data?.output?.image_url) return data.data.output.image_url;
+  if (data?.data?.output?.video_url) return data.data.output.video_url;
+  const videoInfo = data?.data?.videoInfo;
+  if (videoInfo?.videoUrl) return videoInfo.videoUrl;
+  if (videoInfo?.imageUrl) return videoInfo.imageUrl;
+  return null;
+}
+
+async function runwayGenerate(apiKey: string, payload: Record<string, unknown>) {
+  const res = await fetch(`${KIE_BASE_URL}/api/v1/runway/generate`, {
+    method: "POST",
+    headers: getKieHeaders(apiKey),
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  const code = typeof data?.code === "string" ? Number(data.code) : data?.code;
+  if (!res.ok || (typeof code === "number" && code !== 200)) {
+    throw new Error(data?.msg || data?.message || `Runway generate 오류: ${res.status}`);
+  }
+  const taskId = data?.data?.taskId || data?.data?.task_id;
+  if (!taskId) throw new Error("Runway 응답에 taskId가 없습니다.");
+  return { taskId: String(taskId), raw: data };
+}
+
+async function runwayGetTask(apiKey: string, taskId: string) {
+  const url = new URL(`${KIE_BASE_URL}/api/v1/runway/record-detail`);
+  url.searchParams.set("taskId", taskId);
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  const data = await res.json().catch(() => ({}));
+  const code = typeof data?.code === "string" ? Number(data.code) : data?.code;
+  if (!res.ok || (typeof code === "number" && code !== 200)) {
+    throw new Error(data?.msg || `Runway task 조회 오류: ${res.status}`);
+  }
+  return data;
+}
 
 export const appRouter = router({
   system: systemRouter,
@@ -202,6 +318,236 @@ Respond with ONLY the Korean style name exactly as written above. No explanation
         const rawText: string = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '내추럴';
         const matched = VALID_STYLES.find(s => rawText.includes(s));
         return { style: matched || '내추럴' };
+      }),
+  }),
+
+  // ===== Kie AI 생성 =====
+  kie: router({
+    generateImage: publicProcedure
+      .input(z.object({
+        apiKey: z.string().min(1),
+        model: z.string().min(1),
+        prompt: z.string().min(1),
+        aspectRatio: z.string().default("16:9"),
+        referenceImageUrls: z.array(z.string().url()).optional(),
+        pollIntervalMs: z.number().min(1000).max(10000).default(3000),
+        maxPollCount: z.number().min(10).max(300).default(120),
+        callBackUrl: z.string().url().optional(),
+      }))
+      .mutation(async ({ input }) => {
+        // #region agent log
+        fetch('http://127.0.0.1:7396/ingest/1afd1c7a-6278-4472-a50c-eaf839810218',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0a1fce'},body:JSON.stringify({sessionId:'0a1fce',runId:'run1',hypothesisId:'H1',location:'server/routers.ts:generateImage:start',message:'server image generation started',data:{model:input.model,aspectRatio:input.aspectRatio,hasReferenceImages:!!(input.referenceImageUrls&&input.referenceImageUrls.length>0)},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+        const createPayload: Record<string, unknown> = {
+          model: input.model,
+          input: {
+            prompt: input.prompt,
+            aspect_ratio: input.aspectRatio,
+            ...(input.referenceImageUrls && input.referenceImageUrls.length > 0
+              ? { image_input: input.referenceImageUrls }
+              : {}),
+          },
+          ...(input.callBackUrl ? { callBackUrl: input.callBackUrl } : {}),
+        };
+
+        let taskId: string;
+        try {
+          const created = await kieCreateTask(input.apiKey, createPayload);
+          taskId = created.taskId;
+        } catch (error: any) {
+          const message = String(error?.message || "");
+          const hasReferenceImages = !!(input.referenceImageUrls && input.referenceImageUrls.length > 0);
+          const isFileTypeError =
+            message.toLowerCase().includes("file type not supported") ||
+            message.toLowerCase().includes("unsupported") ||
+            message.toLowerCase().includes("image format");
+
+          // 참조 이미지 포맷 문제일 때는 텍스트 프롬프트만으로 자동 재시도
+          if (hasReferenceImages && isFileTypeError) {
+            const fallbackPayload: Record<string, unknown> = {
+              model: input.model,
+              input: {
+                prompt: input.prompt,
+                aspect_ratio: input.aspectRatio,
+              },
+              ...(input.callBackUrl ? { callBackUrl: input.callBackUrl } : {}),
+            };
+            const created = await kieCreateTask(input.apiKey, fallbackPayload);
+            taskId = created.taskId;
+          } else {
+            throw error;
+          }
+        }
+        // #region agent log
+        fetch('http://127.0.0.1:7396/ingest/1afd1c7a-6278-4472-a50c-eaf839810218',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0a1fce'},body:JSON.stringify({sessionId:'0a1fce',runId:'run1',hypothesisId:'H2',location:'server/routers.ts:generateImage:taskCreated',message:'task created for image generation',data:{taskId},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+
+        for (let i = 0; i < input.maxPollCount; i++) {
+          await new Promise((resolve) => setTimeout(resolve, input.pollIntervalMs));
+          const detail = await kieGetTaskRecordInfo(input.apiKey, taskId);
+          const state = normalizeKieState(detail?.data?.state);
+          if (i === 0 || i % 10 === 0 || state === "success" || state === "fail") {
+            // #region agent log
+            fetch('http://127.0.0.1:7396/ingest/1afd1c7a-6278-4472-a50c-eaf839810218',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0a1fce'},body:JSON.stringify({sessionId:'0a1fce',runId:'run1',hypothesisId:'H3',location:'server/routers.ts:generateImage:poll',message:'polling image task state',data:{taskId,iteration:i,state,hasResultUrl:!!extractResultUrlFromRecordInfo(detail),failMsg:detail?.data?.failMsg||null},timestamp:Date.now()})}).catch(()=>{});
+            // #endregion
+          }
+          if (state === "success") {
+            const resultUrl = extractResultUrlFromRecordInfo(detail);
+            if (!resultUrl) {
+              continue;
+            }
+            return {
+              taskId,
+              state,
+              resultUrl,
+            };
+          }
+          if (state === "fail") {
+            return {
+              taskId,
+              state,
+              resultUrl: null,
+              failMsg: detail?.data?.failMsg || detail?.msg || "이미지 생성 실패",
+            };
+          }
+        }
+
+        return {
+          taskId,
+          state: "generating" as KieTaskState,
+          resultUrl: null,
+          failMsg: "이미지 생성이 아직 완료되지 않았습니다. 잠시 후 다시 확인해주세요.",
+        };
+      }),
+
+    generateVideo: publicProcedure
+      .input(z.object({
+        apiKey: z.string().min(1),
+        videoMode: z.enum(["kling_standard", "kling_pro", "veo3_fast", "veo3_quality", "runway_gen4"]),
+        prompt: z.string().min(1),
+        imageUrl: z.string().url(),
+        aspectRatio: z.string().default("16:9"),
+        duration: z.enum(["5", "10"]).default("5"),
+        quality: z.enum(["720p", "1080p"]).default("720p"),
+        pollIntervalMs: z.number().min(1000).max(10000).default(3000),
+        maxPollCount: z.number().min(10).max(300).default(180),
+        callBackUrl: z.string().url().optional(),
+      }))
+      .mutation(async ({ input }) => {
+        // Runway는 전용 API를 사용
+        if (input.videoMode === "runway_gen4") {
+          const runwayPayload: Record<string, unknown> = {
+            prompt: input.prompt,
+            imageUrl: input.imageUrl,
+            duration: Number(input.duration),
+            quality: input.quality,
+            waterMark: "",
+            ...(input.callBackUrl ? { callBackUrl: input.callBackUrl } : {}),
+          };
+          const { taskId } = await runwayGenerate(input.apiKey, runwayPayload);
+          for (let i = 0; i < input.maxPollCount; i++) {
+            await new Promise((resolve) => setTimeout(resolve, input.pollIntervalMs));
+            const detail = await runwayGetTask(input.apiKey, taskId);
+            const state = normalizeKieState(detail?.data?.state);
+            if (state === "success") {
+              const resultUrl = detail?.data?.videoInfo?.videoUrl || null;
+              return { taskId, state, resultUrl };
+            }
+            if (state === "fail") {
+              return {
+                taskId,
+                state,
+                resultUrl: null,
+                failMsg: detail?.data?.failMsg || detail?.msg || "영상 생성 실패",
+              };
+            }
+          }
+          return {
+            taskId,
+            state: "generating" as KieTaskState,
+            resultUrl: null,
+            failMsg: "영상 생성이 아직 완료되지 않았습니다. 잠시 후 다시 확인해주세요.",
+          };
+        }
+
+        // Kling/기타 Market 모델은 createTask + recordInfo를 사용
+        const model =
+          input.videoMode === "kling_pro"
+            ? "kling/v2-1-master-image-to-video"
+            : input.videoMode === "kling_standard"
+              ? "kling/v2-1-standard-image-to-video"
+              : input.videoMode === "veo3_fast"
+                ? "veo3_fast"
+                : "veo3_quality";
+
+        const createPayload: Record<string, unknown> = {
+          model,
+          input: {
+            prompt: input.prompt,
+            duration: input.duration,
+            ...(input.videoMode === "kling_pro"
+              ? { image_url: input.imageUrl }
+              : { image_urls: [input.imageUrl], sound: false }),
+          },
+          ...(input.callBackUrl ? { callBackUrl: input.callBackUrl } : {}),
+        };
+
+        const { taskId } = await kieCreateTask(input.apiKey, createPayload);
+
+        for (let i = 0; i < input.maxPollCount; i++) {
+          await new Promise((resolve) => setTimeout(resolve, input.pollIntervalMs));
+          const detail = await kieGetTaskRecordInfo(input.apiKey, taskId);
+          const state = normalizeKieState(detail?.data?.state);
+          if (state === "success") {
+            const resultUrl = extractResultUrlFromRecordInfo(detail);
+            if (!resultUrl) {
+              continue;
+            }
+            return { taskId, state, resultUrl };
+          }
+          if (state === "fail") {
+            return {
+              taskId,
+              state,
+              resultUrl: null,
+              failMsg: detail?.data?.failMsg || detail?.msg || "영상 생성 실패",
+            };
+          }
+        }
+
+        return {
+          taskId,
+          state: "generating" as KieTaskState,
+          resultUrl: null,
+          failMsg: "영상 생성이 아직 완료되지 않았습니다. 잠시 후 다시 확인해주세요.",
+        };
+      }),
+
+    getTask: publicProcedure
+      .input(z.object({
+        apiKey: z.string().min(1),
+        taskId: z.string().min(1),
+        provider: z.enum(["market", "runway"]).default("market"),
+      }))
+      .query(async ({ input }) => {
+        if (input.provider === "runway") {
+          const data = await runwayGetTask(input.apiKey, input.taskId);
+          const state = normalizeKieState(data?.data?.state);
+          return {
+            taskId: input.taskId,
+            state,
+            resultUrl: data?.data?.videoInfo?.videoUrl || null,
+            failMsg: data?.data?.failMsg || data?.msg || null,
+          };
+        }
+        const data = await kieGetTaskRecordInfo(input.apiKey, input.taskId);
+        const state = normalizeKieState(data?.data?.state);
+        return {
+          taskId: input.taskId,
+          state,
+          resultUrl: extractResultUrlFromRecordInfo(data),
+          failMsg: data?.data?.failMsg || data?.msg || null,
+        };
       }),
   }),
 

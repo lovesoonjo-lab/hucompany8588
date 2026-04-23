@@ -263,127 +263,77 @@ export async function validateGeminiKey(apiKey: string): Promise<boolean> {
 // ===== Kie AI API =====
 const KIE_BASE = 'https://api.kie.ai';
 
-export async function generateImageKie(apiKey: string, prompt: string, aspectRatio: string = '16:9', referenceImageUrls?: string[], model: string = 'nano-banana-2'): Promise<string> {
-  const body: any = {
+export interface KieGenerationResult {
+  taskId: string;
+  state: 'waiting' | 'queuing' | 'generating' | 'success' | 'fail';
+  resultUrl: string | null;
+  failMsg?: string | null;
+}
+
+interface KieRequestOptions {
+  signal?: AbortSignal;
+}
+
+async function callTrpcMutation<T>(path: string, input: Record<string, any>, options?: KieRequestOptions): Promise<T> {
+  const res = await fetch(`/api/trpc/${path}?batch=1`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal: options?.signal,
+    body: JSON.stringify({
+      '0': {
+        json: input,
+      },
+    }),
+  });
+
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !Array.isArray(data) || data[0]?.error) {
+    const trpcMessage = data?.[0]?.error?.json?.message;
+    // #region agent log
+    fetch('http://127.0.0.1:7396/ingest/1afd1c7a-6278-4472-a50c-eaf839810218',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0a1fce'},body:JSON.stringify({sessionId:'0a1fce',runId:'run1',hypothesisId:'H5',location:'client/src/lib/api.ts:callTrpcMutation:error',message:'tRPC mutation failed',data:{path,status:res.status,trpcMessage:trpcMessage||null,hasArrayPayload:Array.isArray(data)},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+    throw new Error(trpcMessage || `요청 실패 (${res.status})`);
+  }
+  return data[0].result.data.json as T;
+}
+
+export async function generateImageKie(
+  apiKey: string,
+  prompt: string,
+  aspectRatio: string = '16:9',
+  referenceImageUrls?: string[],
+  model: string = 'nano-banana-2',
+  options?: KieRequestOptions
+): Promise<KieGenerationResult> {
+  return callTrpcMutation<KieGenerationResult>('kie.generateImage', {
+    apiKey,
     model,
-    input: {
-      prompt,
-      image_input: referenceImageUrls && referenceImageUrls.length > 0 ? referenceImageUrls : [],
-      aspect_ratio: aspectRatio,
-      resolution: '1K',
-      output_format: 'png',
-    },
-  };
-  const createRes = await fetch(`${KIE_BASE}/api/v1/jobs/createTask`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` }, body: JSON.stringify(body) });
-  if (!createRes.ok) { const err = await createRes.json().catch(() => ({})); throw new Error(err?.error?.message || `Kie AI 오류: ${createRes.status}`); }
-  const createData = await createRes.json();
-  const taskId = createData.data?.task_id;
-  if (!taskId) {
-    const immediateUrl = createData.data?.images?.[0]?.url || createData.data?.output?.image_url;
-    if (immediateUrl) return immediateUrl;
-    throw new Error('Kie AI: task_id를 받지 못했습니다.');
-  }
-  for (let i = 0; i < 60; i++) {
-    await new Promise((r) => setTimeout(r, 3000));
-    const pollRes = await fetch(`${KIE_BASE}/api/v1/jobs/${taskId}`, { headers: { 'Authorization': `Bearer ${apiKey}` } });
-    if (!pollRes.ok) continue;
-    const pollData = await pollRes.json();
-    const status = pollData.data?.status;
-    if (status === 'completed' || status === 'succeed') {
-      const imageUrl = pollData.data?.images?.[0]?.url || pollData.data?.output?.image_url || pollData.data?.result?.images?.[0]?.url;
-      if (imageUrl) return imageUrl;
-    }
-    if (status === 'failed') { throw new Error('Kie AI: 이미지 생성 실패'); }
-  }
-  throw new Error('Kie AI: 이미지 생성 시간 초과');
+    prompt,
+    aspectRatio,
+    referenceImageUrls: referenceImageUrls && referenceImageUrls.length > 0 ? referenceImageUrls : undefined,
+  }, options);
 }
 
 // ===== Kie AI Video Generation (Kling, Veo, Runway) =====
 type VideoModel = 'kling_standard' | 'kling_pro' | 'veo3_fast' | 'veo3_quality' | 'runway_gen4';
-
-const VIDEO_MODEL_CONFIG: Record<VideoModel, { model: string; endpoint: string; pollEndpoint: string }> = {
-  kling_standard: {
-    model: 'kling/v2-1-standard-image-to-video',
-    endpoint: `${KIE_BASE}/api/v1/kling/generate`,
-    pollEndpoint: `${KIE_BASE}/api/v1/kling`,
-  },
-  kling_pro: {
-    model: 'kling/v2-1-pro-image-to-video',
-    endpoint: `${KIE_BASE}/api/v1/kling/generate`,
-    pollEndpoint: `${KIE_BASE}/api/v1/kling`,
-  },
-  veo3_fast: {
-    model: 'veo3_fast',
-    endpoint: `${KIE_BASE}/api/v1/veo/generate`,
-    pollEndpoint: `${KIE_BASE}/api/v1/veo`,
-  },
-  veo3_quality: {
-    model: 'veo3_quality',
-    endpoint: `${KIE_BASE}/api/v1/veo/generate`,
-    pollEndpoint: `${KIE_BASE}/api/v1/veo`,
-  },
-  runway_gen4: {
-    model: 'runway-duration-5-generate',
-    endpoint: `${KIE_BASE}/api/v1/runway/generate`,
-    pollEndpoint: `${KIE_BASE}/api/v1/runway`,
-  },
-};
 
 export async function generateVideoKie(
   apiKey: string,
   imageUrl: string,
   prompt: string,
   videoMode: VideoModel,
-  aspectRatio: string = '16:9'
-): Promise<string> {
-  const config = VIDEO_MODEL_CONFIG[videoMode];
-  if (!config) throw new Error(`지원하지 않는 동영상 모델: ${videoMode}`);
-
-  let body: any;
-  if (videoMode.startsWith('kling')) {
-    body = { model: config.model, imageUrl, prompt: prompt || 'Gentle cinematic motion', duration: 5 };
-  } else if (videoMode.startsWith('veo3')) {
-    body = { model: config.model, imageUrls: [imageUrl], prompt: prompt || 'Gentle cinematic motion', aspect_ratio: aspectRatio, generationType: 'REFERENCE_2_VIDEO' };
-  } else {
-    // runway
-    body = { model: config.model, imageUrl, prompt: prompt || 'Gentle cinematic motion' };
-  }
-
-  const createRes = await fetch(config.endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-    body: JSON.stringify(body),
-  });
-  if (!createRes.ok) {
-    const err = await createRes.json().catch(() => ({}));
-    throw new Error(err?.error?.message || err?.message || `동영상 생성 오류: ${createRes.status}`);
-  }
-  const createData = await createRes.json();
-  const taskId = createData.data?.task_id || createData.task_id;
-  if (!taskId) {
-    const immediateUrl = createData.data?.video?.url || createData.data?.output?.video_url;
-    if (immediateUrl) return immediateUrl;
-    throw new Error('동영상 생성: task_id를 받지 못했습니다.');
-  }
-
-  // Poll for completion
-  for (let i = 0; i < 120; i++) {
-    await new Promise((r) => setTimeout(r, 5000));
-    const pollRes = await fetch(`${config.pollEndpoint}/${taskId}`, {
-      headers: { 'Authorization': `Bearer ${apiKey}` },
-    });
-    if (!pollRes.ok) continue;
-    const pollData = await pollRes.json();
-    const status = pollData.data?.status || pollData.state;
-    if (status === 'success' || status === 'completed' || status === 'succeed') {
-      const videoUrl = pollData.data?.video?.url || pollData.data?.output?.video_url || pollData.data?.result?.video?.url || pollData.data?.creations?.[0]?.url;
-      if (videoUrl) return videoUrl;
-    }
-    if (status === 'failed') {
-      throw new Error(`동영상 생성 실패 (${videoMode})`);
-    }
-  }
-  throw new Error(`동영상 생성 시간 초과 (${videoMode})`);
+  aspectRatio: string = '16:9',
+  options?: KieRequestOptions
+): Promise<KieGenerationResult> {
+  return callTrpcMutation<KieGenerationResult>('kie.generateVideo', {
+    apiKey,
+    imageUrl,
+    prompt: prompt || 'Gentle cinematic motion',
+    videoMode,
+    aspectRatio,
+    duration: '5',
+    quality: '720p',
+  }, options);
 }
 
 // ===== Vidu AI API (주석 처리 - 보존용) =====
@@ -500,11 +450,26 @@ export const PROMPTS = {
 여기에 개선된 본문 대본 전체를 작성
 ###END###`,
 
-  analyzeScenes: (aspectRatio: string, imageStyle: string = 'natural', targetSceneCount: number = 15) => `당신은 심리학 유튜브 영상의 스토리보드 전문가입니다.
+  analyzeScenes: (
+    aspectRatio: string,
+    imageStyle: string = 'natural',
+    targetSceneCount: number = 15,
+    options?: {
+      imagePromptLang?: 'en' | 'ko';
+      ttsLang?: 'en' | 'ko';
+      subtitleLang?: 'en' | 'ko';
+      motionPromptLang?: 'en' | 'ko';
+    }
+  ) => `당신은 심리학 유튜브 영상의 스토리보드 전문가입니다.
 주어진 대본을 분석하여 장면별 이미지 프롬프트, TTS 스크립트, 자막을 생성해주세요.
 비율: ${aspectRatio}
 이미지 스타일: ${imageStyle}
 목표 장면 수: ${targetSceneCount}개
+출력 언어 선택:
+- 이미지 프롬프트 우선 언어: ${options?.imagePromptLang ?? 'en'}
+- TTS 우선 언어: ${options?.ttsLang ?? 'en'}
+- 자막 우선 언어: ${options?.subtitleLang ?? 'en'}
+- 모션 프롬프트 우선 언어: ${options?.motionPromptLang ?? 'en'}
 
 대본의 흐름에 맞게 목표 장면 수에 가깝게 장면을 나누고, 각 장면에 대해:
 1. 영문 이미지 프롬프트 (Kie AI Nano Banana 2 모델용, 이미지 스타일 반영, 상세하고 구체적)
@@ -514,6 +479,9 @@ export const PROMPTS = {
 5. 동영상 모션 프롬프트 (영문, 카메라 움직임 설명)
 6. EN TTS Script (영문 나레이션 스크립트)
 7. EN Subtitle (영문 자막, ①②③ 형태로 구분)
+8. KR TTS Script (한국어 TTS)
+9. KR Subtitle (한국어 자막, ①②③ 형태로 구분)
+10. Image Prompt (KO) / Video Motion Prompt (KO)
 
 ★★★ 최우선 규칙: 대본에 이미 메타가 있으면 그대로 사용 ★★★
 - 장면에 "Image Prompt:"가 있으면 promptEn/promptKo를 해당 텍스트에서 추출해 그대로 사용하세요.
@@ -552,7 +520,7 @@ effectType 선택 기준:
 - "shake": 긴장감, 충격, 위기 장면
 
 반드시 아래 JSON 배열 형식으로만 응답하세요:
-[{"promptEn": "영문 프롬프트", "promptKo": "한글 프롬프트", "effectType": "zoom-in", "effectDuration": 2.5, "videoMotionPrompt": "Slow zoom in with gentle parallax", "ttsScript": "English narration text", "subtitleEn": "①First subtitle line②Second subtitle line③Third subtitle line"}]`,
+[{"promptEn":"영문 프롬프트","promptKo":"한글 프롬프트","effectType":"zoom-in","effectDuration":2.5,"videoMotionPrompt":"영문 모션 프롬프트","videoMotionPromptKo":"한글 모션 프롬프트","ttsScript":"EN TTS Script","ttsScriptKo":"KR TTS Script","subtitleEn":"①EN1②EN2③EN3","subtitleKo":"①KR1②KR2③KR3"}]`,
 
   analyzeCharacters: `당신은 영상 대본 분석 전문가입니다.
 주어진 대본에서 등장하는 화자(캐릭터)를 분석해주세요.

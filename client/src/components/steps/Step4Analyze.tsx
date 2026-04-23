@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useAppStore, type SceneSlot, type EffectType, type SubtitleScene } from '@/lib/store';
 import { callGemini, PROMPTS, type ProgressCallbacks } from '@/lib/api';
 import { Loader2, Search, Sparkles, StopCircle } from 'lucide-react';
@@ -174,11 +175,20 @@ export default function Step4Analyze({ tabId }: Step4Props) {
   };
 
   const countRawSceneLabels = (script: string): number => {
+    const lines = (script || '')
+      .split('\n')
+      .map((line) => normalizeScriptLine(line))
+      .filter(Boolean);
+    const parsedLineMatches = lines.filter((line) => parseSceneNumber(line) !== null).length;
+    if (parsedLineMatches > 0) return parsedLineMatches;
+
+    // 한 줄에 여러 라벨이 붙은 경우를 위한 추가 fallback
     const text = (script || '')
       .normalize('NFKC')
       .replace(/[\u200B-\u200D\uFEFF]/g, '');
-    const matches = text.match(/\[\s*(?:scene|장면)\s*\d+\s*\]/gi) || [];
-    return matches.length;
+    const bracketMatches = text.match(/\[\s*(?:scene|장면)\s*\d+\s*\]/gi) || [];
+    const plainMatches = text.match(/(?:^|\s)(?:scene|장면)\s*(?:[:#-]|\s)\s*\d+(?=\s|$)/gim) || [];
+    return Math.max(bracketMatches.length, plainMatches.length);
   };
 
   const countImagePromptsFromScript = (script: string): number => {
@@ -241,6 +251,11 @@ export default function Step4Analyze({ tabId }: Step4Props) {
       .map((text, idx) => ({ id: idx + 1, text }));
   };
 
+  const pickByLang = (enValue: string, koValue: string, lang: 'en' | 'ko') => {
+    if (lang === 'ko') return (koValue || enValue || '').trim();
+    return (enValue || koValue || '').trim();
+  };
+
   const pickEffectFromFx = (fxText: string): EffectType => {
     const t = (fxText || '').toLowerCase();
     if (!t) return 'zoom-in';
@@ -256,14 +271,35 @@ export default function Step4Analyze({ tabId }: Step4Props) {
     return 'zoom-in';
   };
 
+  const pickEffectFromPreset = (presetText: string): EffectType | null => {
+    const t = (presetText || '').toLowerCase().trim();
+    if (!t) return null;
+    if (t.includes('fade-in-hold')) return 'fade-in-hold';
+    if (t.includes('zoom-in-slow') || t.includes('줌인 천천히') || t.includes('슬로우 줌인')) return 'zoom-in-slow';
+    if (t.includes('zoom-in') || t.includes('줌인')) return 'zoom-in';
+    if (t.includes('zoom-out') || t.includes('줌아웃')) return 'zoom-out';
+    if (t.includes('fade-in') || t.includes('페이드인')) return 'fade-in';
+    if (t.includes('fade-out') || t.includes('페이드아웃')) return 'fade-out';
+    if (t.includes('pan-left-to-right') || t.includes('좌→우') || t.includes('좌에서 우')) return 'pan-left-to-right';
+    if (t.includes('pan-right-to-left') || t.includes('우→좌') || t.includes('우에서 좌')) return 'pan-right-to-left';
+    if (t.includes('shake') || t.includes('쉐이크')) return 'shake';
+    if (t.includes('hold') || t.includes('고정')) return 'hold';
+    return null;
+  };
+
   const extractStructuredScenes = (script: string): SceneSlot[] => {
     type Parsed = {
       sceneNo?: number;
       promptEn?: string;
       promptKo?: string;
       tts?: string;
+      ttsKo?: string;
       subtitle?: string;
+      subtitleKo?: string;
       motion?: string;
+      motionKo?: string;
+      baseEffectPresetEn?: string;
+      baseEffectPresetKo?: string;
       fx?: string;
     };
 
@@ -272,7 +308,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
       return sceneBlocks
         .map((block, idx) => {
           const parsed: Parsed = { sceneNo: block.sceneNo };
-          let activeField: 'promptEn' | 'promptKo' | 'tts' | 'subtitle' | 'motion' | 'fx' | null = null;
+          let activeField: 'promptEn' | 'promptKo' | 'tts' | 'ttsKo' | 'subtitle' | 'subtitleKo' | 'motion' | 'motionKo' | 'baseEffectPresetEn' | 'baseEffectPresetKo' | 'fx' | null = null;
 
           for (const line of block.lines) {
             const labelLine = normalizeForLabelMatch(line);
@@ -298,6 +334,12 @@ export default function Step4Analyze({ tabId }: Step4Props) {
               activeField = 'tts';
               continue;
             }
+            const ttsKoMatch = labelLine.match(/kr\s*tts\s*script\s*[:：]\s*(.*)$/i);
+            if (ttsKoMatch) {
+              parsed.ttsKo = (ttsKoMatch[1] || '').trim();
+              activeField = 'ttsKo';
+              continue;
+            }
 
             const subMatch = labelLine.match(/en\s*subtitle\s*[:：]\s*(.*)$/i);
             if (subMatch) {
@@ -305,11 +347,35 @@ export default function Step4Analyze({ tabId }: Step4Props) {
               activeField = 'subtitle';
               continue;
             }
+            const subKoMatch = labelLine.match(/kr\s*subtitle\s*[:：]\s*(.*)$/i);
+            if (subKoMatch) {
+              parsed.subtitleKo = (subKoMatch[1] || '').trim();
+              activeField = 'subtitleKo';
+              continue;
+            }
 
+            const motionKoMatch = labelLine.match(/video\s*motion\s*prompt\s*[\(\[]\s*ko\s*[\)\]]\s*[:：]\s*(.*)$/i);
+            if (motionKoMatch) {
+              parsed.motionKo = (motionKoMatch[1] || '').trim();
+              activeField = 'motionKo';
+              continue;
+            }
             const motionMatch = labelLine.match(/video\s*motion\s*prompt\s*[:：]\s*(.*)$/i);
             if (motionMatch) {
               parsed.motion = (motionMatch[1] || '').trim();
               activeField = 'motion';
+              continue;
+            }
+            const effectPresetKoMatch = labelLine.match(/base\s*effect\s*preset\s*[\(\[]\s*ko\s*[\)\]]\s*[:：]\s*(.*)$/i);
+            if (effectPresetKoMatch) {
+              parsed.baseEffectPresetKo = (effectPresetKoMatch[1] || '').trim();
+              activeField = 'baseEffectPresetKo';
+              continue;
+            }
+            const effectPresetEnMatch = labelLine.match(/base\s*effect\s*preset(?:\s*[\(\[]\s*en\s*[\)\]])?\s*[:：]\s*(.*)$/i);
+            if (effectPresetEnMatch) {
+              parsed.baseEffectPresetEn = (effectPresetEnMatch[1] || '').trim();
+              activeField = 'baseEffectPresetEn';
               continue;
             }
 
@@ -328,18 +394,26 @@ export default function Step4Analyze({ tabId }: Step4Props) {
           if (!parsed.promptEn && !parsed.promptKo) return null;
           const promptEn = (parsed.promptEn || parsed.promptKo || '').trim();
           const promptKo = (parsed.promptKo || parsed.promptEn || '').trim();
-          const subtitleScenes = normalizeSubtitleScenes(parsed.subtitle || '');
-          const ttsScript = (parsed.tts || subtitleScenes.map((x) => x.text).join(' ') || '').trim();
-          const effectType = pickEffectFromFx(parsed.fx || '');
-          const duration = ttsScript.length < 50 ? 2.5 : ttsScript.length < 100 ? 3.5 : 4.5;
+          const chosenPrompt = pickByLang(promptEn, promptKo, tab.analyzeImagePromptLang);
+          const chosenSubtitle = pickByLang(parsed.subtitle || '', parsed.subtitleKo || '', tab.analyzeSubtitleLang);
+          const subtitleScenes = normalizeSubtitleScenes(chosenSubtitle);
+          const chosenTts = pickByLang(parsed.tts || '', parsed.ttsKo || '', tab.analyzeTtsLang);
+          const ttsScript = (chosenTts || subtitleScenes.map((x) => x.text).join(' ') || '').trim();
+          const chosenMotion = pickByLang(parsed.motion || '', parsed.motionKo || '', tab.analyzeMotionPromptLang);
+          const chosenBasePreset = pickByLang(
+            parsed.baseEffectPresetEn || '',
+            parsed.baseEffectPresetKo || '',
+            tab.analyzeMotionPromptLang
+          );
+          const effectType = pickEffectFromPreset(chosenBasePreset) || pickEffectFromFx(parsed.fx || '');
 
           return {
             id: parsed.sceneNo || idx + 1,
-            promptEn,
+            promptEn: chosenPrompt || promptEn,
             promptKo,
             effectType,
-            effectDuration: duration,
-            videoMotionPrompt: (parsed.motion || '').trim(),
+            effectDuration: 0,
+            videoMotionPrompt: chosenMotion || (parsed.motion || '').trim(),
             imageUrl: null,
             videoUrl: null,
             isGeneratingImage: false,
@@ -377,7 +451,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
 
     const parsed: Parsed[] = [];
     let current: Parsed | null = null;
-    let activeField: 'promptEn' | 'promptKo' | 'tts' | 'subtitle' | 'motion' | 'fx' | null = null;
+    let activeField: 'promptEn' | 'promptKo' | 'tts' | 'ttsKo' | 'subtitle' | 'subtitleKo' | 'motion' | 'motionKo' | 'baseEffectPresetEn' | 'baseEffectPresetKo' | 'fx' | null = null;
 
     const pushCurrentIfValid = () => {
       if (!current) return;
@@ -436,6 +510,13 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         activeField = 'tts';
         continue;
       }
+      const ttsKoMatch = labelLine.match(/kr\s*tts\s*script\s*[:：]\s*(.*)$/i);
+      if (ttsKoMatch) {
+        ensureCurrent();
+        current!.ttsKo = (ttsKoMatch[1] || '').trim();
+        activeField = 'ttsKo';
+        continue;
+      }
 
       const subMatch = labelLine.match(/en\s*subtitle\s*[:：]\s*(.*)$/i);
       if (subMatch) {
@@ -444,12 +525,40 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         activeField = 'subtitle';
         continue;
       }
+      const subKoMatch = labelLine.match(/kr\s*subtitle\s*[:：]\s*(.*)$/i);
+      if (subKoMatch) {
+        ensureCurrent();
+        current!.subtitleKo = (subKoMatch[1] || '').trim();
+        activeField = 'subtitleKo';
+        continue;
+      }
 
+      const motionKoMatch = labelLine.match(/video\s*motion\s*prompt\s*[\(\[]\s*ko\s*[\)\]]\s*[:：]\s*(.*)$/i);
+      if (motionKoMatch) {
+        ensureCurrent();
+        current!.motionKo = (motionKoMatch[1] || '').trim();
+        activeField = 'motionKo';
+        continue;
+      }
       const motionMatch = labelLine.match(/video\s*motion\s*prompt\s*[:：]\s*(.*)$/i);
       if (motionMatch) {
         ensureCurrent();
         current!.motion = (motionMatch[1] || '').trim();
         activeField = 'motion';
+        continue;
+      }
+      const effectPresetKoMatch = labelLine.match(/base\s*effect\s*preset\s*[\(\[]\s*ko\s*[\)\]]\s*[:：]\s*(.*)$/i);
+      if (effectPresetKoMatch) {
+        ensureCurrent();
+        current!.baseEffectPresetKo = (effectPresetKoMatch[1] || '').trim();
+        activeField = 'baseEffectPresetKo';
+        continue;
+      }
+      const effectPresetEnMatch = labelLine.match(/base\s*effect\s*preset(?:\s*[\(\[]\s*en\s*[\)\]])?\s*[:：]\s*(.*)$/i);
+      if (effectPresetEnMatch) {
+        ensureCurrent();
+        current!.baseEffectPresetEn = (effectPresetEnMatch[1] || '').trim();
+        activeField = 'baseEffectPresetEn';
         continue;
       }
 
@@ -473,19 +582,26 @@ export default function Step4Analyze({ tabId }: Step4Props) {
       .map((s, idx) => {
         const promptEn = (s.promptEn || s.promptKo || '').trim();
         const promptKo = (s.promptKo || s.promptEn || '').trim();
-        const subtitleScenes = normalizeSubtitleScenes(s.subtitle || '');
-        const ttsScript = (s.tts || subtitleScenes.map((x) => x.text).join(' ') || '').trim();
-        const effectType = pickEffectFromFx(s.fx || '');
-        const duration =
-          ttsScript.length < 50 ? 2.5 : ttsScript.length < 100 ? 3.5 : 4.5;
+        const chosenPrompt = pickByLang(promptEn, promptKo, tab.analyzeImagePromptLang);
+        const chosenSubtitle = pickByLang(s.subtitle || '', s.subtitleKo || '', tab.analyzeSubtitleLang);
+        const subtitleScenes = normalizeSubtitleScenes(chosenSubtitle);
+        const chosenTts = pickByLang(s.tts || '', s.ttsKo || '', tab.analyzeTtsLang);
+        const ttsScript = (chosenTts || subtitleScenes.map((x) => x.text).join(' ') || '').trim();
+        const chosenMotion = pickByLang(s.motion || '', s.motionKo || '', tab.analyzeMotionPromptLang);
+        const chosenBasePreset = pickByLang(
+          s.baseEffectPresetEn || '',
+          s.baseEffectPresetKo || '',
+          tab.analyzeMotionPromptLang
+        );
+        const effectType = pickEffectFromPreset(chosenBasePreset) || pickEffectFromFx(s.fx || '');
 
         return {
           id: s.sceneNo || idx + 1,
-          promptEn,
+          promptEn: chosenPrompt || promptEn,
           promptKo,
           effectType,
-          effectDuration: duration,
-          videoMotionPrompt: (s.motion || '').trim(),
+          effectDuration: 0,
+          videoMotionPrompt: chosenMotion || (s.motion || '').trim(),
           imageUrl: null,
           videoUrl: null,
           isGeneratingImage: false,
@@ -536,7 +652,7 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         promptEn: `Cinematic scene ${i + 1}, psychology documentary style, moody lighting, detailed composition`,
         promptKo: `장면 ${i + 1}: ${short || '심리학 설명 장면'}`,
         effectType: 'zoom-in',
-        effectDuration: 2.5,
+        effectDuration: 0,
         videoMotionPrompt: 'Slow zoom in with gentle camera motion',
         imageUrl: null,
         videoUrl: null,
@@ -631,7 +747,11 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         ? (rawEffect as EffectType)
         : 'zoom-in';
 
-      const subtitleText = scene.subtitleEn || '';
+      const subtitleText = pickByLang(
+        scene.subtitleEn || scene.subtitle || '',
+        scene.subtitleKo || '',
+        tab.analyzeSubtitleLang
+      );
       const subtitleScenes: SubtitleScene[] = [];
       if (subtitleText) {
         const parts = subtitleText.split(/[①②③④⑤⑥⑦⑧⑨⑩]/).filter((s: string) => s.trim());
@@ -643,18 +763,38 @@ export default function Step4Analyze({ tabId }: Step4Props) {
         }
       }
 
+      const promptEnRaw = (scene.promptEn || '').trim();
+      const promptKoRaw = (scene.promptKo || '').trim();
+      const selectedPrompt = pickByLang(promptEnRaw, promptKoRaw, tab.analyzeImagePromptLang);
+      const selectedTts = pickByLang(
+        scene.ttsScript || scene.tts || '',
+        scene.ttsScriptKo || scene.ttsKo || '',
+        tab.analyzeTtsLang
+      );
+      const selectedMotion = pickByLang(
+        scene.videoMotionPrompt || '',
+        scene.videoMotionPromptKo || '',
+        tab.analyzeMotionPromptLang
+      );
+      const selectedBasePreset = pickByLang(
+        scene.baseEffectPresetEn || scene.baseEffectPreset || '',
+        scene.baseEffectPresetKo || '',
+        tab.analyzeMotionPromptLang
+      );
+      const parsedPresetEffect = pickEffectFromPreset(selectedBasePreset);
+
       return {
         id: i + 1,
-        promptEn: scene.promptEn || '',
-        promptKo: scene.promptKo || '',
-        effectType,
-        effectDuration: scene.effectDuration || 2.5,
-        videoMotionPrompt: scene.videoMotionPrompt || '',
+        promptEn: selectedPrompt || promptEnRaw || promptKoRaw || '',
+        promptKo: promptKoRaw || promptEnRaw || '',
+        effectType: parsedPresetEffect || effectType,
+        effectDuration: 0,
+        videoMotionPrompt: selectedMotion || scene.videoMotionPrompt || '',
         imageUrl: null,
         videoUrl: null,
         isGeneratingImage: false,
         isGeneratingVideo: false,
-        ttsScript: scene.ttsScript || '',
+        ttsScript: selectedTts || subtitleText || '',
         subtitleScenes,
         audioUrl: null,
         audioDuration: 0,
@@ -833,7 +973,13 @@ export default function Step4Analyze({ tabId }: Step4Props) {
               PROMPTS.analyzeScenes(
                 tab.selectedAspectRatio || tab.aspectRatio,
                 tab.imageStyle || 'natural',
-                batchTarget
+                batchTarget,
+                {
+                  imagePromptLang: tab.analyzeImagePromptLang,
+                  ttsLang: tab.analyzeTtsLang,
+                  subtitleLang: tab.analyzeSubtitleLang,
+                  motionPromptLang: tab.analyzeMotionPromptLang,
+                }
               ),
               progressCallbacks,
               abortController.signal
@@ -852,7 +998,13 @@ export default function Step4Analyze({ tabId }: Step4Props) {
               PROMPTS.analyzeScenes(
                 tab.selectedAspectRatio || tab.aspectRatio,
                 tab.imageStyle || 'natural',
-                reducedSceneCount
+                reducedSceneCount,
+                {
+                  imagePromptLang: tab.analyzeImagePromptLang,
+                  ttsLang: tab.analyzeTtsLang,
+                  subtitleLang: tab.analyzeSubtitleLang,
+                  motionPromptLang: tab.analyzeMotionPromptLang,
+                }
               ),
               undefined,
               abortController.signal
@@ -871,7 +1023,13 @@ export default function Step4Analyze({ tabId }: Step4Props) {
           PROMPTS.analyzeScenes(
             tab.selectedAspectRatio || tab.aspectRatio,
             tab.imageStyle || 'natural',
-            targetSceneCount
+            targetSceneCount,
+            {
+              imagePromptLang: tab.analyzeImagePromptLang,
+              ttsLang: tab.analyzeTtsLang,
+              subtitleLang: tab.analyzeSubtitleLang,
+              motionPromptLang: tab.analyzeMotionPromptLang,
+            }
           ),
           progressCallbacks,
           abortController.signal
@@ -891,7 +1049,13 @@ export default function Step4Analyze({ tabId }: Step4Props) {
             PROMPTS.analyzeScenes(
               tab.selectedAspectRatio || tab.aspectRatio,
               tab.imageStyle || 'natural',
-              reducedSceneCount
+              reducedSceneCount,
+              {
+                imagePromptLang: tab.analyzeImagePromptLang,
+                ttsLang: tab.analyzeTtsLang,
+                subtitleLang: tab.analyzeSubtitleLang,
+                motionPromptLang: tab.analyzeMotionPromptLang,
+              }
             ),
             progressCallbacks,
             abortController.signal
@@ -942,7 +1106,13 @@ export default function Step4Analyze({ tabId }: Step4Props) {
             PROMPTS.analyzeScenes(
               tab.selectedAspectRatio || tab.aspectRatio,
               tab.imageStyle || 'natural',
-              reducedSceneCount
+              reducedSceneCount,
+              {
+                imagePromptLang: tab.analyzeImagePromptLang,
+                ttsLang: tab.analyzeTtsLang,
+                subtitleLang: tab.analyzeSubtitleLang,
+                motionPromptLang: tab.analyzeMotionPromptLang,
+              }
             ),
             undefined,
             abortController.signal
@@ -1012,9 +1182,13 @@ export default function Step4Analyze({ tabId }: Step4Props) {
   const rawPromptCount = countImagePromptsFromScript(rawSource);
   const scriptSceneCount = countRawSceneLabels(scriptFromStep1);
   const rawSceneCount = countRawSceneLabels(rawSource);
+  const scriptEmbeddedSceneHintCount = countEmbeddedSceneHints(scriptFromStep1);
+  const rawEmbeddedSceneHintCount = countEmbeddedSceneHints(rawSource);
   const preferRawSource =
     rawPromptCount > scriptPromptCount || (rawPromptCount === 0 && rawSceneCount > scriptSceneCount);
-  const detectedSceneLabelCount = preferRawSource ? rawSceneCount : scriptSceneCount;
+  const selectedSceneLabelCount = preferRawSource ? rawSceneCount : scriptSceneCount;
+  const selectedEmbeddedSceneHintCount = preferRawSource ? rawEmbeddedSceneHintCount : scriptEmbeddedSceneHintCount;
+  const detectedSceneLabelCount = selectedSceneLabelCount > 0 ? selectedSceneLabelCount : selectedEmbeddedSceneHintCount;
   const detectedImagePromptCount = preferRawSource ? rawPromptCount : scriptPromptCount;
 
   return (
@@ -1042,8 +1216,72 @@ export default function Step4Analyze({ tabId }: Step4Props) {
             효과: {settings.videoGenerationMode === 'static_effect' ? '정지 이미지 + 기본 효과' : settings.videoGenerationMode}
           </span>
         </div>
+        <div className="mt-2 overflow-x-auto">
+          <div className="flex items-end gap-2 min-w-max">
+            <div className="w-44 shrink-0">
+            <p className="text-[11px] text-muted-foreground mb-1">오디오(TTS) 기준</p>
+            <Select
+              value={tab.analyzeTtsLang}
+              onValueChange={(value: 'en' | 'ko') => updateTab(tabId, { analyzeTtsLang: value })}
+            >
+              <SelectTrigger className="h-8 text-xs bg-background/60 border-border">
+                <SelectValue placeholder="TTS 언어" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="ko">한국어 TTS</SelectItem>
+                <SelectItem value="en">영어 TTS</SelectItem>
+              </SelectContent>
+            </Select>
+            </div>
+            <div className="w-44 shrink-0">
+            <p className="text-[11px] text-muted-foreground mb-1">자막 기준</p>
+            <Select
+              value={tab.analyzeSubtitleLang}
+              onValueChange={(value: 'en' | 'ko') => updateTab(tabId, { analyzeSubtitleLang: value })}
+            >
+              <SelectTrigger className="h-8 text-xs bg-background/60 border-border">
+                <SelectValue placeholder="자막 언어" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="ko">한국어 자막</SelectItem>
+                <SelectItem value="en">영어 자막</SelectItem>
+              </SelectContent>
+            </Select>
+            </div>
+            <div className="w-52 shrink-0">
+            <p className="text-[11px] text-muted-foreground mb-1">이미지 프롬프트 기준</p>
+            <Select
+              value={tab.analyzeImagePromptLang}
+              onValueChange={(value: 'en' | 'ko') => updateTab(tabId, { analyzeImagePromptLang: value })}
+            >
+              <SelectTrigger className="h-8 text-xs bg-background/60 border-border">
+                <SelectValue placeholder="이미지 프롬프트 언어" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="ko">한국어 프롬프트 사용</SelectItem>
+                <SelectItem value="en">영어 프롬프트 사용</SelectItem>
+              </SelectContent>
+            </Select>
+            </div>
+            <div className="w-60 shrink-0">
+            <p className="text-[11px] text-muted-foreground mb-1">동영상 모션 프롬프트 기준</p>
+            <Select
+              value={tab.analyzeMotionPromptLang}
+              onValueChange={(value: 'en' | 'ko') => updateTab(tabId, { analyzeMotionPromptLang: value })}
+            >
+              <SelectTrigger className="h-8 text-xs bg-background/60 border-border">
+                <SelectValue placeholder="모션 프롬프트 언어" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="ko">한국어 모션 프롬프트</SelectItem>
+                <SelectItem value="en">영어 모션 프롬프트</SelectItem>
+              </SelectContent>
+            </Select>
+            </div>
+          </div>
+        </div>
         <p className="text-xs text-muted-foreground mt-1">
-          분석 결과: 이미지 프롬프트(EN/KO) + TTS Script(EN) + Subtitle(EN, ①②③) + 모션 프롬프트
+          분석 결과: Image Prompt (EN/KO), EN/KR TTS Script, EN/KR Subtitle(①②③), Video Motion Prompt (EN/KO)
         </p>
         <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground mt-1">
           <span className="px-2 py-0.5 rounded bg-secondary border border-border">

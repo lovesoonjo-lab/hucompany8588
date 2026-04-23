@@ -316,8 +316,7 @@ export default function Home() {
         {/* Header */}
         <header className="border-b border-border bg-background/80 backdrop-blur-xl shrink-0">
           <div className="flex items-center justify-between h-14 px-6">
-            <div className="flex items-center gap-3">
-              <img src={LOGO_URL} alt="Logo" className="w-8 h-8 rounded-lg" />
+            <div className="flex items-center gap-2">
               <div>
                 <h1 className="text-xl font-bold tracking-tight leading-none">
                   HUCOMPANY 유튜브 스튜디오

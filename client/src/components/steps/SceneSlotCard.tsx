@@ -2,10 +2,10 @@ import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useAppStore, type SceneSlot, type EffectType } from '@/lib/store';
 import { generateImageKie, generateVideoKie } from '@/lib/api';
-import { Loader2, ImageIcon, Video, Play } from 'lucide-react';
+import { Loader2, ImageIcon, Video, Play, Square, RotateCcw } from 'lucide-react';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 
 interface SceneSlotCardProps {
   tabId: string;
@@ -14,6 +14,8 @@ interface SceneSlotCardProps {
   aspectRatio: string;
   referenceImageUrls?: string[];
   imageModel?: string;
+  promptUsageLabel?: string;
+  selectedPromptLang?: 'en' | 'ko';
 }
 
 const effectLabels: Record<EffectType, string> = {
@@ -49,31 +51,134 @@ export default function SceneSlotCard({
   aspectRatio,
   referenceImageUrls,
   imageModel,
+  promptUsageLabel,
+  selectedPromptLang = 'en',
 }: SceneSlotCardProps) {
   const { settings, updateScene } = useAppStore();
   const videoRef = useRef<HTMLVideoElement>(null);
   const [isVideoPlaying, setIsVideoPlaying] = useState(false);
+  const [imageProgress, setImageProgress] = useState(0);
+  const imageAbortRef = useRef<AbortController | null>(null);
+  const imageProgressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const imageTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (imageProgressTimerRef.current) clearInterval(imageProgressTimerRef.current);
+      if (imageTimeoutRef.current) clearTimeout(imageTimeoutRef.current);
+      imageAbortRef.current?.abort();
+    };
+  }, []);
+
+  const startImageProgress = () => {
+    setImageProgress(0);
+    if (imageProgressTimerRef.current) clearInterval(imageProgressTimerRef.current);
+    imageProgressTimerRef.current = setInterval(() => {
+      setImageProgress((prev) => {
+        if (prev >= 95) return 95;
+        const next = prev + Math.floor(Math.random() * 6) + 2;
+        return Math.min(next, 95);
+      });
+    }, 900);
+  };
+
+  const stopImageProgress = () => {
+    if (imageProgressTimerRef.current) {
+      clearInterval(imageProgressTimerRef.current);
+      imageProgressTimerRef.current = null;
+    }
+  };
 
   const handleGenerateImage = async () => {
+    // #region agent log
+    fetch('http://127.0.0.1:7396/ingest/1afd1c7a-6278-4472-a50c-eaf839810218',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0a1fce'},body:JSON.stringify({sessionId:'0a1fce',runId:'run1',hypothesisId:'H1',location:'SceneSlotCard.tsx:88',message:'image generation clicked',data:{tabId,sceneId:scene.id,hasPrompt:!!scene.promptEn},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     if (!settings.kieApiKey) {
       toast.error('설정에서 Kie AI API 키를 먼저 입력해주세요.');
       return;
     }
-    updateScene(tabId, scene.id, { isGeneratingImage: true });
+    updateScene(tabId, scene.id, {
+      isGeneratingImage: true,
+      imageError: null,
+      imageTaskState: 'waiting',
+      imageTaskId: null,
+    });
+    const abortController = new AbortController();
+    imageAbortRef.current = abortController;
+    startImageProgress();
+    if (imageTimeoutRef.current) clearTimeout(imageTimeoutRef.current);
+    imageTimeoutRef.current = setTimeout(() => {
+      abortController.abort();
+    }, 120000); // 2분 초과 시 자동 중지
     try {
-      const imageUrl = await generateImageKie(
+      const result = await generateImageKie(
         settings.kieApiKey,
         scene.promptEn,
         aspectRatio,
         referenceImageUrls && referenceImageUrls.length > 0 ? referenceImageUrls : undefined,
-        imageModel || 'nano-banana-2'
+        imageModel || 'nano-banana-2',
+        { signal: abortController.signal }
       );
-      updateScene(tabId, scene.id, { imageUrl, isGeneratingImage: false });
+      // #region agent log
+      fetch('http://127.0.0.1:7396/ingest/1afd1c7a-6278-4472-a50c-eaf839810218',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0a1fce'},body:JSON.stringify({sessionId:'0a1fce',runId:'run1',hypothesisId:'H2',location:'SceneSlotCard.tsx:115',message:'image generation result received',data:{sceneId:scene.id,taskId:result.taskId,state:result.state,hasResultUrl:!!result.resultUrl,failMsg:result.failMsg||null},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+      if (!result.resultUrl) {
+        throw new Error(result.failMsg || '이미지 URL이 반환되지 않았습니다.');
+      }
+      stopImageProgress();
+      setImageProgress(100);
+      updateScene(tabId, scene.id, {
+        imageUrl: result.resultUrl,
+        isGeneratingImage: false,
+        imageTaskId: result.taskId,
+        imageTaskState: result.state,
+        imageError: null,
+      });
       toast.success(`장면 ${scene.id} 이미지 생성 완료`);
+      setTimeout(() => setImageProgress(0), 600);
     } catch (err: any) {
-      updateScene(tabId, scene.id, { isGeneratingImage: false });
-      toast.error(`장면 ${scene.id} 이미지 생성 실패: ${err.message}`);
+      // #region agent log
+      fetch('http://127.0.0.1:7396/ingest/1afd1c7a-6278-4472-a50c-eaf839810218',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0a1fce'},body:JSON.stringify({sessionId:'0a1fce',runId:'run1',hypothesisId:'H5',location:'SceneSlotCard.tsx:129',message:'image generation catch',data:{sceneId:scene.id,errorName:err?.name||null,errorMessage:err?.message||String(err)},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+      stopImageProgress();
+      const isAborted = err?.name === 'AbortError';
+      updateScene(tabId, scene.id, {
+        isGeneratingImage: false,
+        imageTaskState: isAborted ? 'idle' : 'fail',
+        imageError: isAborted ? '생성이 중지되었거나 시간이 초과되었습니다.' : (err.message || '이미지 생성 실패'),
+      });
+      setImageProgress(0);
+      if (isAborted) {
+        toast.info(`장면 ${scene.id} 이미지 생성을 중지했습니다. (또는 시간 초과)`);
+      } else {
+        toast.error(`장면 ${scene.id} 이미지 생성 실패: ${err.message}`);
+      }
+    } finally {
+      if (imageTimeoutRef.current) {
+        clearTimeout(imageTimeoutRef.current);
+        imageTimeoutRef.current = null;
+      }
+      imageAbortRef.current = null;
     }
+  };
+
+  const handleCancelImageGeneration = () => {
+    // #region agent log
+    fetch('http://127.0.0.1:7396/ingest/1afd1c7a-6278-4472-a50c-eaf839810218',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0a1fce'},body:JSON.stringify({sessionId:'0a1fce',runId:'run1',hypothesisId:'H4',location:'SceneSlotCard.tsx:152',message:'image generation cancelled by user',data:{sceneId:scene.id},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+    if (!scene.isGeneratingImage) return;
+    updateScene(tabId, scene.id, {
+      isGeneratingImage: false,
+      imageTaskState: 'idle',
+      imageError: '사용자가 생성을 중지했습니다.',
+    });
+    stopImageProgress();
+    setImageProgress(0);
+    if (imageTimeoutRef.current) {
+      clearTimeout(imageTimeoutRef.current);
+      imageTimeoutRef.current = null;
+    }
+    imageAbortRef.current?.abort();
   };
 
   const handleGenerateVideo = async () => {
@@ -92,21 +197,63 @@ export default function SceneSlotCard({
       return;
     }
 
-    updateScene(tabId, scene.id, { isGeneratingVideo: true });
+    updateScene(tabId, scene.id, {
+      isGeneratingVideo: true,
+      videoError: null,
+      videoTaskState: 'waiting',
+      videoTaskId: null,
+    });
     try {
-      const videoUrl = await generateVideoKie(
+      const result = await generateVideoKie(
         settings.kieApiKey,
         scene.imageUrl,
         scene.videoMotionPrompt,
         videoMode as any,
         aspectRatio
       );
-      updateScene(tabId, scene.id, { videoUrl, isGeneratingVideo: false });
+      if (!result.resultUrl) {
+        throw new Error(result.failMsg || '동영상 URL이 반환되지 않았습니다.');
+      }
+      updateScene(tabId, scene.id, {
+        videoUrl: result.resultUrl,
+        isGeneratingVideo: false,
+        videoTaskId: result.taskId,
+        videoTaskState: result.state,
+        videoError: null,
+      });
       toast.success(`장면 ${scene.id} 동영상 생성 완료`);
     } catch (err: any) {
-      updateScene(tabId, scene.id, { isGeneratingVideo: false });
+      updateScene(tabId, scene.id, {
+        isGeneratingVideo: false,
+        videoTaskState: 'fail',
+        videoError: err.message || '동영상 생성 실패',
+      });
       toast.error(`장면 ${scene.id} 동영상 생성 실패: ${err.message}`);
     }
+  };
+
+  const handleResetGeneratedImage = () => {
+    updateScene(tabId, scene.id, {
+      imageUrl: null,
+      isGeneratingImage: false,
+      imageTaskId: null,
+      imageTaskState: 'idle',
+      imageError: null,
+      // 이미지 기반으로 생성된 동영상도 함께 초기화
+      videoUrl: null,
+      isGeneratingVideo: false,
+      videoTaskId: null,
+      videoTaskState: 'idle',
+      videoError: null,
+    });
+    stopImageProgress();
+    setImageProgress(0);
+    imageAbortRef.current?.abort();
+    if (imageTimeoutRef.current) {
+      clearTimeout(imageTimeoutRef.current);
+      imageTimeoutRef.current = null;
+    }
+    toast.success(`장면 ${scene.id} 이미지가 초기화되었습니다.`);
   };
 
   const currentEffect = (scene.effectType || 'zoom-in') as EffectType;
@@ -168,7 +315,13 @@ export default function SceneSlotCard({
         ) : scene.isGeneratingImage ? (
           <div className="flex flex-col items-center gap-2">
             <Loader2 className="w-6 h-6 animate-spin text-primary" />
-            <span className="text-xs text-muted-foreground">생성 중...</span>
+            <span className="text-xs text-muted-foreground">생성 중... {imageProgress}%</span>
+            <div className="w-40 h-1.5 rounded-full bg-muted overflow-hidden">
+              <div
+                className="h-full bg-primary transition-all duration-300"
+                style={{ width: `${Math.max(0, Math.min(imageProgress, 100))}%` }}
+              />
+            </div>
           </div>
         ) : (
           <div className="flex flex-col items-center gap-1 text-muted-foreground/40">
@@ -181,9 +334,16 @@ export default function SceneSlotCard({
       {/* Prompts */}
       <div className="p-3 space-y-2">
         <div>
-          <label className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-            Prompt (EN)
-          </label>
+          <div className="flex items-center gap-1.5">
+            <label className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+              Image Prompt (EN)
+            </label>
+            {selectedPromptLang === 'en' && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded border border-primary/40 bg-primary/10 text-primary whitespace-nowrap">
+                {promptUsageLabel || '[선택]'}
+              </span>
+            )}
+          </div>
           <textarea
             value={scene.promptEn}
             onChange={(e) => updateScene(tabId, scene.id, { promptEn: e.target.value })}
@@ -191,9 +351,16 @@ export default function SceneSlotCard({
           />
         </div>
         <div>
-          <label className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-            프롬프트 (KO)
-          </label>
+          <div className="flex items-center gap-1.5">
+            <label className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+              Image Prompt (KO)
+            </label>
+            {selectedPromptLang === 'ko' && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded border border-primary/40 bg-primary/10 text-primary whitespace-nowrap">
+                {promptUsageLabel || '[선택]'}
+              </span>
+            )}
+          </div>
           <textarea
             value={scene.promptKo}
             onChange={(e) => updateScene(tabId, scene.id, { promptKo: e.target.value })}
@@ -221,13 +388,14 @@ export default function SceneSlotCard({
             </Select>
             <input
               type="number"
-              value={scene.effectDuration}
+              value={scene.effectDuration > 0 ? scene.effectDuration : ''}
               onChange={(e) =>
-                updateScene(tabId, scene.id, { effectDuration: parseFloat(e.target.value) || 2.5 })
+                updateScene(tabId, scene.id, { effectDuration: e.target.value === '' ? 0 : (parseFloat(e.target.value) || 0) })
               }
               min={1}
               max={10}
               step={0.5}
+              placeholder="-"
               className="w-16 h-7 bg-background border border-border rounded px-2 text-xs text-center focus:outline-none focus:ring-1 focus:ring-primary/50"
             />
             <span className="text-xs text-muted-foreground">초</span>
@@ -237,16 +405,19 @@ export default function SceneSlotCard({
         {/* Action buttons */}
         <div className="flex gap-2 pt-1">
           <Button
-            onClick={handleGenerateImage}
-            disabled={scene.isGeneratingImage || !scene.promptEn}
+            onClick={scene.isGeneratingImage ? handleCancelImageGeneration : handleGenerateImage}
+            disabled={!scene.isGeneratingImage && !scene.promptEn}
             size="sm"
             variant="outline"
-            className="flex-1 h-8 text-xs border-border"
+            className={cn(
+              'flex-1 h-8 text-xs border-border',
+              scene.isGeneratingImage && 'border-destructive/40 text-destructive hover:bg-destructive/10'
+            )}
           >
             {scene.isGeneratingImage ? (
-              <Loader2 className="w-3 h-3 animate-spin" />
+              <><Square className="w-3 h-3 mr-1" /> 중지</>
             ) : (
-              <><ImageIcon className="w-3 h-3 mr-1" /> 이미지</>
+              <><ImageIcon className="w-3 h-3 mr-1" /> 이미지 생성</>
             )}
           </Button>
           {settings.videoGenerationMode !== 'static_effect' && (
@@ -264,7 +435,36 @@ export default function SceneSlotCard({
               )}
             </Button>
           )}
+          <Button
+            onClick={handleResetGeneratedImage}
+            disabled={!scene.imageUrl && !scene.videoUrl && !scene.isGeneratingImage}
+            size="sm"
+            variant="outline"
+            className="h-8 text-xs border-border"
+          >
+            <RotateCcw className="w-3 h-3 mr-1" /> 초기화
+          </Button>
         </div>
+        {(scene.imageTaskId || scene.videoTaskId || scene.imageError || scene.videoError) && (
+          <div className="space-y-1 pt-1">
+            {scene.imageTaskId && (
+              <p className="text-[10px] text-muted-foreground">
+                이미지 Task: {scene.imageTaskId} ({scene.imageTaskState || 'waiting'})
+              </p>
+            )}
+            {scene.videoTaskId && (
+              <p className="text-[10px] text-muted-foreground">
+                동영상 Task: {scene.videoTaskId} ({scene.videoTaskState || 'waiting'})
+              </p>
+            )}
+            {scene.imageError && (
+              <p className="text-[10px] text-destructive">이미지 오류: {scene.imageError}</p>
+            )}
+            {scene.videoError && (
+              <p className="text-[10px] text-destructive">동영상 오류: {scene.videoError}</p>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

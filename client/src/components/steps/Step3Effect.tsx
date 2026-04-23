@@ -6,6 +6,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { toast } from 'sonner';
 import { trpc } from '@/lib/trpc';
 import { useAuth } from '@/_core/hooks/useAuth';
+import { generateImageKie } from '@/lib/api';
 
 
 
@@ -14,10 +15,7 @@ interface Step3Props {
 }
 
 const imageStyles: ImageStyle[] = [
-  'reference', 'rich-portrait', 'natural', 'editorial', 'illustration',
-  '3d-character', 'risograph', 'pixel-art', 'oil-painting', 'korean-traditional',
-  'cartoon', 'pop-surreal', 'vibrant-film', 'fashion-photo', 'glitch-collage',
-  'retro-film', 'cross-process', 'wild-landscape', 'bold-line', 'watercolor',
+  'cartoon',
 ];
 
 // 각 스타일을 대표하는 예시 이미지 URL
@@ -33,6 +31,8 @@ const IMAGE_STYLE_PREVIEWS: Record<ImageStyle, string> = {
   'editorial': 'https://images.unsplash.com/photo-1469334031218-e382a71b716b?w=160&h=120&fit=crop&auto=format&q=60',
   // 일러스트: 컬러풀한 디지털 아트
   'illustration': 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=160&h=120&fit=crop&auto=format&q=60',
+  // 캐릭터+실사배경: 실사 배경 위 캐릭터 합성 느낌
+  'character-real-bg': 'https://images.unsplash.com/photo-1519501025264-65ba15a82390?w=160&h=120&fit=crop&auto=format&q=60',
   // 3D 캐릭터: 3D 렌더링 (Picsum 안정적 ID)
   '3d-character': 'https://picsum.photos/seed/3dchar/160/120',
   // 리소그래프: 꽃 프린트 스타일
@@ -64,6 +64,7 @@ const IMAGE_STYLE_PREVIEWS: Record<ImageStyle, string> = {
   // 수채화: 수채화 꽃 그림
   'watercolor': 'https://images.unsplash.com/photo-1541701494587-cb58502866ab?w=160&h=120&fit=crop&auto=format&q=60',
 };
+
 
 const aspectRatios: { value: AspectRatio; label: string; icon: React.ElementType; desc: string }[] = [
   { value: '16:9', label: '16:9', icon: RectangleHorizontal, desc: '가로형 (유튜브)' },
@@ -146,6 +147,9 @@ const STYLE_LABEL_TO_KEY: Record<string, ImageStyle> = {
   '내추럴': 'natural',
   '에디토리얼': 'editorial',
   '일러스트': 'illustration',
+  '캐릭터+실사배경': 'character-real-bg',
+  '캐릭터 + 실사배경': 'character-real-bg',
+  '캐릭터 실사배경': 'character-real-bg',
   '3D 캐릭터': '3d-character',
   '리소그래프': 'risograph',
   '꼭셀아트': 'pixel-art',
@@ -172,6 +176,8 @@ export default function Step3Effect({ tabId }: Step3Props) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [isDetecting, setIsDetecting] = useState(false);
+  const [isGeneratingKiePreview, setIsGeneratingKiePreview] = useState(false);
+  const [stylePreviewOverrides, setStylePreviewOverrides] = useState<Partial<Record<ImageStyle, string>>>({});
 
   const analyzeImageMutation = trpc.gemini.analyzeImage.useMutation();
 
@@ -268,6 +274,64 @@ export default function Step3Effect({ tabId }: Step3Props) {
 
   const handleStyleSelect = (style: ImageStyle) => {
     updateTab(tabId, { imageStyle: style });
+  };
+
+  const handleGenerateCharacterRealBgPreview = async () => {
+    if (!settings.kieApiKey) {
+      toast.error('설정에서 Kie AI API 키를 먼저 입력해주세요.');
+      return;
+    }
+
+    let referenceUrls: string[] | undefined;
+    if (tab.serverReferenceMode === 'server') {
+      const firstServerChar = serverCharacterAssetsQuery.data?.[0];
+      if (firstServerChar?.fileUrl) {
+        referenceUrls = [firstServerChar.fileUrl];
+      }
+    } else if (referenceImages.length > 0) {
+      const first = referenceImages[0];
+      // blob URL은 Kie에서 직접 접근 불가하므로 제외
+      if (first?.url && !first.url.startsWith('blob:')) {
+        referenceUrls = [first.url];
+      }
+    }
+
+    if (!referenceUrls || referenceUrls.length === 0) {
+      toast.info('참조 캐릭터 URL이 없어 기본 캐릭터 스타일로 생성합니다. (서버 이미지 또는 URL 이미지 권장)');
+    }
+
+    setIsGeneratingKiePreview(true);
+    try {
+      const prompt = [
+        'Create a full-body Korean cartoon character composited naturally into a realistic photo background.',
+        'The character must stay center-framed, sharp, and clearly separated from background.',
+        'Use a photorealistic modern city campus/plaza background, cinematic golden-hour lighting, natural shadows.',
+        'Preserve character identity from reference image, keep outfit details accurate, no extra characters.',
+        'High quality, clean composition, realistic depth, editorial look.',
+      ].join(' ');
+
+      const result = await generateImageKie(
+        settings.kieApiKey,
+        prompt,
+        '4:3',
+        referenceUrls,
+        'nano-banana-2'
+      );
+
+      if (!result.resultUrl) {
+        throw new Error(result.failMsg || 'Kie 미리보기 생성 결과 URL이 없습니다.');
+      }
+
+      setStylePreviewOverrides((prev) => ({
+        ...prev,
+        'character-real-bg': result.resultUrl!,
+      }));
+      toast.success('Kie AI로 캐릭터+실사배경 미리보기를 생성했습니다.');
+    } catch (err: any) {
+      toast.error(err?.message || 'Kie 미리보기 생성 중 오류가 발생했습니다.');
+    } finally {
+      setIsGeneratingKiePreview(false);
+    }
   };
 
   const handleAspectSelect = (ratio: AspectRatio) => {
@@ -568,6 +632,24 @@ export default function Step3Effect({ tabId }: Step3Props) {
               <><Wand2 className="w-3 h-3" /><span>✨ 자동 추천</span></>
             )}
           </button>
+          <button
+            type="button"
+            onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleGenerateCharacterRealBgPreview(); }}
+            disabled={isGeneratingKiePreview}
+            title="Kie AI로 캐릭터+실사배경 미리보기를 생성합니다"
+            className={cn(
+              'flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium transition-all border',
+              !isGeneratingKiePreview
+                ? 'border-primary/40 bg-primary/5 text-primary hover:bg-primary/15 cursor-pointer'
+                : 'border-border/40 bg-secondary/20 text-muted-foreground/40 cursor-not-allowed'
+            )}
+          >
+            {isGeneratingKiePreview ? (
+              <><Loader2 className="w-3 h-3 animate-spin" /><span>Kie 생성 중...</span></>
+            ) : (
+              <><Sparkles className="w-3 h-3" /><span>캐릭터+실사배경 미리보기 생성</span></>
+            )}
+          </button>
         </div>
         <p className="text-xs text-muted-foreground">
           생성할 이미지의 아트 스타일을 선택하세요. 선택한 스타일이 프롬프트에 자동 반영됩니다.
@@ -587,7 +669,7 @@ export default function Step3Effect({ tabId }: Step3Props) {
               {/* 예시 이미지 */}
               <div className="relative w-full aspect-[4/3] overflow-hidden bg-secondary/50">
                 <img
-                  src={IMAGE_STYLE_PREVIEWS[style]}
+                  src={stylePreviewOverrides[style] || IMAGE_STYLE_PREVIEWS[style]}
                   alt={IMAGE_STYLE_LABELS[style]}
                   className="w-full h-full object-cover transition-transform duration-300 hover:scale-105"
                   loading="lazy"
@@ -595,6 +677,11 @@ export default function Step3Effect({ tabId }: Step3Props) {
                     (e.target as HTMLImageElement).src = 'https://picsum.photos/seed/fallback/160/120';
                   }}
                 />
+                {style === 'character-real-bg' && (
+                  <div className="absolute left-1 top-1 rounded bg-black/65 px-1.5 py-0.5">
+                    <span className="text-[9px] font-semibold text-white">캐릭터+실사배경</span>
+                  </div>
+                )}
                 {tab.imageStyle === style && (
                   <div className="absolute inset-0 bg-primary/20 flex items-center justify-center">
                     <div className="w-4 h-4 rounded-full bg-primary flex items-center justify-center">

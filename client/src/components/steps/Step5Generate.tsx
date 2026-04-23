@@ -11,6 +11,7 @@ import { useRef, useMemo } from 'react';
 import SceneSlotCard from './SceneSlotCard';
 import Step5Audio from './Step5Audio';
 import Step5Render from './Step5Render';
+import Step5Thumbnail from './Step5Thumbnail';
 import { trpc } from '@/lib/trpc';
 import { useAuth } from '@/_core/hooks/useAuth';
 
@@ -21,6 +22,8 @@ interface Step5Props {
 export default function Step5Generate({ tabId }: Step5Props) {
   const { settings, tabs, updateTab, updateScene } = useAppStore();
   const tab = tabs.find((t) => t.id === tabId)!;
+  const promptUsageLabel = '[선택]';
+  const selectedPromptLang: 'en' | 'ko' = tab.analyzeImagePromptLang === 'ko' ? 'ko' : 'en';
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { isAuthenticated } = useAuth();
 
@@ -29,27 +32,38 @@ export default function Step5Generate({ tabId }: Step5Props) {
     { projectId: tab.serverProjectId!, category: 'character' },
     { enabled: tab.serverReferenceMode === 'server' && !!tab.serverProjectId && isAuthenticated }
   );
-  const serverBackgroundAssets = trpc.asset.list.useQuery(
-    { projectId: tab.serverProjectId!, category: 'background' },
-    { enabled: tab.serverReferenceMode === 'server' && !!tab.serverProjectId && isAuthenticated }
-  );
 
-  // 참조 이미지 URL 결정 (로컬 vs 서버)
-  const effectiveReferenceUrls = useMemo(() => {
+  // 이미지 생성용 캐릭터 참조 URL (로컬 vs 서버)
+  const effectiveCharacterReferenceUrls = useMemo(() => {
     if (tab.serverReferenceMode === 'server' && tab.serverProjectId) {
       const charUrls = (serverCharacterAssets.data || []).map(a => a.fileUrl);
-      const bgUrls = (serverBackgroundAssets.data || []).map(a => a.fileUrl);
-      return [...charUrls, ...bgUrls];
+      return charUrls;
     }
     return tab.referenceImages && tab.referenceImages.length > 0
       ? tab.referenceImages.map(img => img.url)
       : undefined;
-  }, [tab.serverReferenceMode, tab.serverProjectId, serverCharacterAssets.data, serverBackgroundAssets.data, tab.referenceImages]);
+  }, [tab.serverReferenceMode, tab.serverProjectId, serverCharacterAssets.data, tab.referenceImages]);
+
+  const buildCharacterLockedPrompt = (basePrompt: string) => {
+    if (!effectiveCharacterReferenceUrls || effectiveCharacterReferenceUrls.length === 0) {
+      return basePrompt;
+    }
+    return [
+      basePrompt,
+      '',
+      'Character consistency requirements:',
+      '- Keep the exact same character identity as the reference image(s).',
+      '- Keep same face shape, hairstyle, glasses, hat, and hanbok silhouette.',
+      '- Do not change character age, ethnicity, or core costume design.',
+      '- Background and camera can vary, but character identity must remain locked.',
+    ].join('\n');
+  };
 
   const subTabs = [
     { id: 'images' as const, label: '이미지 작업', icon: ImageIcon },
     { id: 'audio' as const, label: '오디오 / 자막', icon: Mic },
     { id: 'render' as const, label: '영상 렌더링', icon: Film },
+    { id: 'thumbnail' as const, label: '썸네일 만들기', icon: ImageIcon },
   ];
 
   // ===== Image Tab Actions =====
@@ -72,17 +86,28 @@ export default function Step5Generate({ tabId }: Step5Props) {
       if (scene.imageUrl || !scene.promptEn) continue;
       updateScene(tabId, scene.id, { isGeneratingImage: true });
       try {
-        const imageUrl = await generateImageKie(
+        const result = await generateImageKie(
           settings.kieApiKey,
-          scene.promptEn,
+          buildCharacterLockedPrompt(scene.promptEn),
           tab.selectedAspectRatio || tab.aspectRatio,
-          effectiveReferenceUrls,
+          effectiveCharacterReferenceUrls,
           tab.imageModel || 'nano-banana-2'
         );
-        updateScene(tabId, scene.id, { imageUrl, isGeneratingImage: false });
+        if (!result.resultUrl) throw new Error(result.failMsg || '이미지 생성 결과 URL이 없습니다.');
+        updateScene(tabId, scene.id, {
+          imageUrl: result.resultUrl,
+          isGeneratingImage: false,
+          imageTaskId: result.taskId,
+          imageTaskState: result.state,
+          imageError: null,
+        });
         success++;
-      } catch {
-        updateScene(tabId, scene.id, { isGeneratingImage: false });
+      } catch (err: any) {
+        updateScene(tabId, scene.id, {
+          isGeneratingImage: false,
+          imageTaskState: 'fail',
+          imageError: err?.message || '이미지 생성 실패',
+        });
         fail++;
       }
     }
@@ -107,17 +132,28 @@ export default function Step5Generate({ tabId }: Step5Props) {
       if (scene.videoUrl || !scene.imageUrl) continue;
       updateScene(tabId, scene.id, { isGeneratingVideo: true });
       try {
-        const videoUrl = await generateVideoKie(
+        const result = await generateVideoKie(
           settings.kieApiKey,
           scene.imageUrl,
           scene.videoMotionPrompt,
           videoMode as any,
           tab.selectedAspectRatio || tab.aspectRatio
         );
-        updateScene(tabId, scene.id, { videoUrl, isGeneratingVideo: false });
+        if (!result.resultUrl) throw new Error(result.failMsg || '동영상 생성 결과 URL이 없습니다.');
+        updateScene(tabId, scene.id, {
+          videoUrl: result.resultUrl,
+          isGeneratingVideo: false,
+          videoTaskId: result.taskId,
+          videoTaskState: result.state,
+          videoError: null,
+        });
         success++;
-      } catch {
-        updateScene(tabId, scene.id, { isGeneratingVideo: false });
+      } catch (err: any) {
+        updateScene(tabId, scene.id, {
+          isGeneratingVideo: false,
+          videoTaskState: 'fail',
+          videoError: err?.message || '동영상 생성 실패',
+        });
         fail++;
       }
     }
@@ -249,24 +285,35 @@ export default function Step5Generate({ tabId }: Step5Props) {
             </Button>
           </>
         )}
+
+        {tab.step5Tab === 'thumbnail' && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="border-border"
+            onClick={() => toast.info('썸네일 생성은 썸네일 만들기 탭에서 실행해주세요.')}
+          >
+            <ImageIcon className="w-4 h-4 mr-1" /> 썸네일 생성
+          </Button>
+        )}
       </div>
 
       {/* Reference image preview */}
-      {effectiveReferenceUrls && effectiveReferenceUrls.length > 0 && (
+      {effectiveCharacterReferenceUrls && effectiveCharacterReferenceUrls.length > 0 && (
         <div className="p-3 rounded-lg bg-secondary/20 border border-border">
           <p className="text-xs font-medium text-muted-foreground mb-2">
-            캐릭터 참조 이미지 ({effectiveReferenceUrls.length}장)
+            캐릭터 참조 이미지 ({effectiveCharacterReferenceUrls.length}장)
           </p>
           <div className="flex flex-wrap items-start gap-[15px] rounded-md">
-            {effectiveReferenceUrls.slice(0, 10).map((url, idx) => (
+            {effectiveCharacterReferenceUrls.slice(0, 10).map((url, idx) => (
               <div key={`${url}-${idx}`} className="w-16 h-16 overflow-hidden shrink-0">
                 <img src={url} alt={`참조 ${idx + 1}`} className="w-full h-full object-cover" />
               </div>
             ))}
           </div>
-          {effectiveReferenceUrls.length > 10 && (
+          {effectiveCharacterReferenceUrls.length > 10 && (
             <p className="text-[10px] text-muted-foreground mt-2">
-              외 {effectiveReferenceUrls.length - 10}장도 이미지 생성 시 함께 참조됩니다.
+              외 {effectiveCharacterReferenceUrls.length - 10}장도 이미지 생성 시 함께 참조됩니다.
             </p>
           )}
         </div>
@@ -282,8 +329,10 @@ export default function Step5Generate({ tabId }: Step5Props) {
               scene={scene}
               showEffects={settings.videoGenerationMode === 'static_effect'}
               aspectRatio={tab.selectedAspectRatio || tab.aspectRatio}
-              referenceImageUrls={effectiveReferenceUrls}
+              referenceImageUrls={effectiveCharacterReferenceUrls}
               imageModel={tab.imageModel}
+              promptUsageLabel={promptUsageLabel}
+              selectedPromptLang={selectedPromptLang}
             />
           ))}
         </div>
@@ -295,6 +344,10 @@ export default function Step5Generate({ tabId }: Step5Props) {
 
       {tab.step5Tab === 'render' && (
         <Step5Render tabId={tabId} />
+      )}
+
+      {tab.step5Tab === 'thumbnail' && (
+        <Step5Thumbnail tabId={tabId} />
       )}
     </div>
   );
